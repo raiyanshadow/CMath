@@ -187,10 +187,10 @@ jobs:
             throw "Could not query the vcpkg version."
           }
 
-          Write-Host "Installing zstd:x64-windows-static..."
-          & $vcpkgExe install zstd:x64-windows-static
+          Write-Host "Installing zstd:x64-windows-static and zlib:x64-windows-static..."
+          & & $vcpkgExe install zstd:x64-windows-static zlib:x64-windows-static
           if ($LASTEXITCODE -ne 0) {
-            throw "vcpkg failed to install zstd:x64-windows-static."
+            throw "vcpkg failed to install zstd:x64-windows-static abd zlib:x64-windows-static."
           }
 
           $zstdConfig = Join-Path $env:VCPKG_ROOT "installed/x64-windows-static/share/zstd/zstdConfig.cmake"
@@ -207,8 +207,9 @@ jobs:
           path: |
             C:\vcpkg\installed
             C:\vcpkg\downloads
-          key: vcpkg-windows-2022-x64-static-zstd-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
-
+          key: vcpkg-windows-2022-x64-static-zstd-zlib-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
+          restore-keys: |
+            vcpkg-windows-2022-x64-static-zstd-zlib-
       - name: Locate Visual Studio DIA SDK
         shell: pwsh
         run: |

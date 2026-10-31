@@ -17,6 +17,7 @@ function(cmath_add_native_compiler language_target)
     endif()
 
     find_package(zstd CONFIG REQUIRED)
+    find_package(ZLIB REQUIRED)
     find_package(LLVM REQUIRED CONFIG)
     if(MSVC)
         set(_CMATH_MSVC_RUNTIME
