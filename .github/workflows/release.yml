@@ -1,0 +1,180 @@
+name: CMath Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and release CMath (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install LLVM 23.1.4 and vcpkg dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Download the LLVM developer archive. CMath needs the C++ headers,
+          # libraries, and LLVMConfig.cmake, not just the clang installer.
+          $llvmVersion = "23.1.4"
+          $llvmArchiveName = "clang+llvm-$llvmVersion-x86_64-pc-windows-msvc.tar.xz"
+          $llvmUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/$llvmArchiveName"
+          $llvmArchive = Join-Path $env:RUNNER_TEMP $llvmArchiveName
+          $expectedSha256 = "854bffcfc84528e0ee92490ff5c178920abd358a79c3e98f053e41e3e8e4c6d2"
+
+          Invoke-WebRequest -Uri $llvmUrl -OutFile $llvmArchive
+          $actualSha256 = (Get-FileHash $llvmArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "LLVM archive SHA-256 mismatch. Expected $expectedSha256, got $actualSha256."
+          }
+
+          tar -xf $llvmArchive -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract the LLVM developer archive."
+          }
+
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "clang+llvm-$llvmVersion-x86_64-pc-windows-msvc"
+          $llvmConfig = Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"
+          if (-not (Test-Path $llvmConfig)) {
+            throw "LLVMConfig.cmake was not found at $llvmConfig."
+          }
+
+          # Install zstd using the same static x64 triplet used by CMath.
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to clone vcpkg."
+          }
+
+          & (Join-Path $vcpkgRoot "bootstrap-vcpkg.bat") -disableMetrics
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to bootstrap vcpkg."
+          }
+
+          & (Join-Path $vcpkgRoot "vcpkg.exe") install zstd:x64-windows-static
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install zstd:x64-windows-static."
+          }
+
+          # Locate the DIA SDK supplied with the Visual Studio installation.
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio/Installer/vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe was not found at $vswhere."
+          }
+
+          $vsInstall = & $vswhere -latest -products "*" -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsInstall) {
+            throw "Could not locate the Visual Studio installation."
+          }
+
+          $diaDir = Join-Path $vsInstall "DIA SDK"
+          if (-not (Test-Path $diaDir)) {
+            throw "Visual Studio DIA SDK was not found at $diaDir."
+          }
+
+          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MSVC_DIA_SDK_DIR=$diaDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          (Join-Path $llvmRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64 `
+            "-DLLVM_DIR=$env:LLVM_DIR" `
+            "-DMSVC_DIA_SDK_DIR=$env:MSVC_DIA_SDK_DIR" `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static" `
+            "-Dzstd_DIR=$env:VCPKG_ROOT/installed/x64-windows-static/share/zstd" `
+            "-DCMATH_CLANGXX_EXECUTABLE=clang++"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configuration failed."
+          }
+
+      - name: Build mathmake
+        shell: pwsh
+        run: |
+          cmake --build build-x64 --config Release --target mathmake --parallel
+          if ($LASTEXITCODE -ne 0) {
+            throw "The mathmake build failed."
+          }
+
+      - name: Verify compiler version
+        shell: pwsh
+        run: |
+          $version = & .\build-x64\Release\mathmake.exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "mathmake --version failed."
+          }
+          Write-Host $version
+          if ($version -notmatch "0\.2") {
+            throw "Expected a CMath 0.2 mathmake binary, got: $version"
+          }
+
+      - name: Run native compiler smoke test
+        shell: pwsh
+        run: |
+          $output = & .\build-x64\Release\mathmake.exe run .\examples\native_smoke.cmath 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+
+          if ($exitCode -ne 0) {
+            throw "The native compiler smoke test failed with exit code $exitCode."
+          }
+
+          # The smoke-test program prints a numeric result. Confirm that the
+          # produced executable ran and emitted that result.
+          $hasNumericOutput = $output | Where-Object { "$_" -match '^\s*[0-9]+(\.[0-9]+)?\s*$' }
+          if (-not $hasNumericOutput) {
+            throw "The native smoke-test executable did not print its expected numeric result."
+          }
+
+      - name: Package release files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $packageDir = Join-Path $env:RUNNER_TEMP "CMath-release"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+          Copy-Item ".\build-x64\Release\mathmake.exe" $packageDir
+          Copy-Item ".\README.md" $packageDir
+          Copy-Item ".\LICENSE" $packageDir
+
+          $examplesDir = Join-Path $packageDir "examples"
+          New-Item -ItemType Directory -Force -Path $examplesDir | Out-Null
+          Copy-Item ".\examples\native_smoke.cmath" $examplesDir
+
+          # Include LLVM's shared runtime when this LLVM distribution provides it.
+          $llvmDll = Join-Path $env:LLVM_ROOT "bin\LLVM.dll"
+          if (Test-Path $llvmDll) {
+            Copy-Item $llvmDll $packageDir
+          }
+
+          $archiveName = "CMath-$tag-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $archiveName -Force
+
+          $sha256 = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$archiveName.sha256", "$sha256  $archiveName")
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: CMath ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            CMath-*-windows-x64.zip
+            CMath-*-windows-x64.zip.sha256
