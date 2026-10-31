@@ -78,48 +78,51 @@ jobs:
           path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
           key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
 
-      - name: Extract and configure LLVM
+      - name: Extract LLVM archive
         shell: pwsh
-        timeout-minutes: 25
         run: |
           $ErrorActionPreference = "Stop"
 
-          $llvmArchiveName = "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
-          $llvmArchive = Join-Path $env:RUNNER_TEMP $llvmArchiveName
-          $llvmRoot = Join-Path $env:RUNNER_TEMP "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc"
+          Write-Host "Installing Zstandard decompression support..."
+          python -m pip install --disable-pip-version-check --no-warn-script-location zstandard
 
-          if (-not (Test-Path $llvmArchive)) {
-            throw "LLVM archive is missing: $llvmArchive"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install Python zstandard."
           }
 
-          if (-not (Test-Path (Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"))) {
-            # Windows Server 2022 tar.exe (bsdtar/libarchive) reads .tar.zst.
-            Write-Host "Extracting LLVM .tar.zst archive (this may take several minutes)..."
-            & tar.exe -xf $llvmArchive -C $env:RUNNER_TEMP
-            if ($LASTEXITCODE -ne 0) {
-              throw "Failed to extract the LLVM .tar.zst archive."
-            }
-          }
-          else {
-            Write-Host "LLVM extraction already exists; skipping extraction."
+          $tarArchive = Join-Path $env:RUNNER_TEMP "llvm.tar"
+
+          Write-Host "Decompressing LLVM archive..."
+          $decompressScript = @'
+          import sys
+          import zstandard
+
+          source_path = sys.argv[1]
+          target_path = sys.argv[2]
+
+          with open(source_path, "rb") as source:
+              with open(target_path, "wb") as target:
+                  zstandard.ZstdDecompressor().copy_stream(source, target)
+
+          print("Decompression complete.")
+          '@
+
+          $decompressScript | python - $llvmArchive $tarArchive
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to decompress LLVM archive."
           }
 
-          $llvmConfig = Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"
-          $clangxx = Join-Path $llvmRoot "bin/clang++.exe"
-          if (-not (Test-Path $llvmConfig)) {
-            throw "LLVMConfig.cmake was not found at $llvmConfig."
-          }
-          if (-not (Test-Path $clangxx)) {
-            throw "clang++.exe was not found at $clangxx."
+          Write-Host "Extracting LLVM files..."
+          tar.exe -xf $tarArchive -C $env:RUNNER_TEMP
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract LLVM tar archive."
           }
 
-          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $llvmBin = Join-Path $llvmRoot "bin"
-          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Remove-Item $tarArchive -Force
 
-          Write-Host "LLVM $env:LLVM_VERSION is ready."
-          Write-Host "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')"
+          Write-Host "LLVM extraction completed successfully."
 
       # Reuse vcpkg already installed on the Windows runner.
       - name: Restore vcpkg dependency cache
