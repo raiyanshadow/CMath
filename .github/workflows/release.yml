@@ -92,22 +92,24 @@ jobs:
 
           $tarArchive = Join-Path $env:RUNNER_TEMP "llvm.tar"
 
+          $env:LLVM_ARCHIVE_PATH = $llvmArchive
+          $env:LLVM_TAR_PATH = $tarArchive
+
           Write-Host "Decompressing LLVM archive..."
-          $decompressScript = @'
-          import sys
+
+          @'
+          import os
           import zstandard
 
-          source_path = sys.argv[1]
-          target_path = sys.argv[2]
+          source_path = os.environ["LLVM_ARCHIVE_PATH"]
+          target_path = os.environ["LLVM_TAR_PATH"]
 
           with open(source_path, "rb") as source:
               with open(target_path, "wb") as target:
                   zstandard.ZstdDecompressor().copy_stream(source, target)
 
           print("Decompression complete.")
-          '@
-
-          $decompressScript | python - $llvmArchive $tarArchive
+          '@ | python -
 
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to decompress LLVM archive."
@@ -121,6 +123,8 @@ jobs:
           }
 
           Remove-Item $tarArchive -Force
+          Remove-Item Env:LLVM_ARCHIVE_PATH
+          Remove-Item Env:LLVM_TAR_PATH
 
           Write-Host "LLVM extraction completed successfully."
 
