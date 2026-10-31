@@ -197,7 +197,7 @@ jobs:
           $installedDir = Join-Path $env:VCPKG_ROOT "installed/x64-windows-static"
           $zstdConfig = Join-Path $installedDir "share/zstd/zstdConfig.cmake"
           $zlibHeader = Join-Path $installedDir "include/zlib.h"
-          $zlibLibrary = Join-Path $installedDir "lib/zlib.lib"
+          $zlibWrapper = Join-Path $installedDir "share/zlib/vcpkg-cmake-wrapper.cmake"
 
           if (-not (Test-Path $zstdConfig)) {
             throw "zstdConfig.cmake was not found at $zstdConfig"
@@ -207,9 +207,13 @@ jobs:
             throw "zlib.h was not found at $zlibHeader"
           }
 
-          if (-not (Test-Path $zlibLibrary)) {
-            throw "zlib.lib was not found at $zlibLibrary"
+          if (-not (Test-Path $zlibWrapper)) {
+            throw "vcpkg's zlib CMake wrapper was not found at $zlibWrapper"
           }
+
+          Write-Host "Installed zlib libraries:"
+          Get-ChildItem (Join-Path $installedDir "lib") -Filter "*.lib" |
+            ForEach-Object { Write-Host "  $($_.Name)" }
 
           Write-Host "zstd and zlib dependencies are ready."
 
