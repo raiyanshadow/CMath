@@ -78,7 +78,7 @@ jobs:
           path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
           key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
 
-            - name: Extract LLVM archive
+      - name: Extract LLVM archive
         shell: pwsh
         timeout-minutes: 20
         run: |
