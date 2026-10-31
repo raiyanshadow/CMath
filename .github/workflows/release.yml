@@ -78,12 +78,12 @@ jobs:
           path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
           key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
 
-      - name: Extract LLVM archive
+            - name: Extract LLVM archive
         shell: pwsh
+        timeout-minutes: 20
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Reconstruct the path: PowerShell variables do not persist between steps.
           $llvmArchive = Join-Path $env:RUNNER_TEMP "clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst"
           $tarArchive = Join-Path $env:RUNNER_TEMP "llvm.tar"
 
@@ -132,6 +132,24 @@ jobs:
           }
 
           Remove-Item $tarArchive -Force
+
+          # Persist LLVM paths for all subsequent workflow steps.
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "clang+llvm-23.1.4-x86_64-pc-windows-msvc"
+
+          if (-not (Test-Path (Join-Path $llvmRoot "bin/clang++.exe"))) {
+            throw "LLVM extraction failed: clang++.exe was not found."
+          }
+
+          if (-not (Test-Path (Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"))) {
+            throw "LLVM extraction failed: LLVMConfig.cmake was not found."
+          }
+
+          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          (Join-Path $llvmRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          Write-Host "LLVM_ROOT=$llvmRoot"
+          Write-Host "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')"
           Write-Host "LLVM extraction completed successfully."
 
       # Reuse vcpkg already installed on the Windows runner.
