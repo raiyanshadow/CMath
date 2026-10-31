@@ -112,7 +112,10 @@ jobs:
 
           with open(source_path, "rb") as source:
               with open(target_path, "wb") as target:
-                  zstandard.ZstdDecompressor().copy_stream(source, target)
+                  zstandard.ZstdDecompressor(
+                      max_window_size=2**31
+                  ).copy_stream(source, target)
+                  decompressor.copy_stream(source, target)
 
           print("LLVM decompression completed.")
           '@ | python -
