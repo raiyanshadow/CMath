@@ -1,6 +1,5 @@
 domain Real
 
-def distance(x: Real, y: Real) -> Real:
-    return sqrt(x^2 + y^2)
-
-print(distance(e, pi))
+let x: Real = 10
+let y: Real = 20
+print(x + y)
