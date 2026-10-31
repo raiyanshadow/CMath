@@ -8,66 +8,184 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: cmath-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LLVM_VERSION: "23.1.4"
+  VCPKG_ROOT: "C:\\vcpkg"
+
 jobs:
   build-and-release:
     name: Build and release CMath (Windows x64)
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Install LLVM 23.1.4 and vcpkg dependencies
+      # Cache the smaller zstd-compressed LLVM archive.
+      - name: Restore LLVM archive cache
+        id: llvm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
+          key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
+
+      - name: Download and verify LLVM 23.1.4
+        shell: pwsh
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $llvmArchiveName = "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          $llvmUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/$llvmArchiveName"
+          $llvmArchive = Join-Path $env:RUNNER_TEMP $llvmArchiveName
+          $expectedSha256 = "1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091"
+
+          if (Test-Path $llvmArchive) {
+            Write-Host "Using cached LLVM archive: $llvmArchive"
+          }
+          else {
+            Write-Host "Downloading LLVM $env:LLVM_VERSION developer archive (about 264 MiB)..."
+            & curl.exe --location --fail --show-error `
+              --retry 5 --retry-all-errors --retry-delay 5 `
+              --connect-timeout 30 --speed-limit 1024 --speed-time 120 `
+              --max-time 1800 --progress-bar `
+              --output $llvmArchive $llvmUrl
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "LLVM download failed with curl exit code $LASTEXITCODE."
+            }
+          }
+
+          Write-Host "Verifying LLVM archive SHA-256..."
+          $actualSha256 = (Get-FileHash $llvmArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            Remove-Item $llvmArchive -Force -ErrorAction SilentlyContinue
+            throw "LLVM archive SHA-256 mismatch. Expected $expectedSha256, got $actualSha256."
+          }
+
+          Write-Host "LLVM archive checksum verified."
+
+      - name: Save LLVM archive cache
+        if: success() && steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
+          key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
+
+      - name: Extract and configure LLVM
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $llvmArchiveName = "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          $llvmArchive = Join-Path $env:RUNNER_TEMP $llvmArchiveName
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc"
+
+          if (-not (Test-Path $llvmArchive)) {
+            throw "LLVM archive is missing: $llvmArchive"
+          }
+
+          if (-not (Test-Path (Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"))) {
+            # Windows Server 2022 tar.exe (bsdtar/libarchive) reads .tar.zst.
+            Write-Host "Extracting LLVM .tar.zst archive (this may take several minutes)..."
+            & tar.exe -xf $llvmArchive -C $env:RUNNER_TEMP
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to extract the LLVM .tar.zst archive."
+            }
+          }
+          else {
+            Write-Host "LLVM extraction already exists; skipping extraction."
+          }
+
+          $llvmConfig = Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"
+          $clangxx = Join-Path $llvmRoot "bin/clang++.exe"
+          if (-not (Test-Path $llvmConfig)) {
+            throw "LLVMConfig.cmake was not found at $llvmConfig."
+          }
+          if (-not (Test-Path $clangxx)) {
+            throw "clang++.exe was not found at $clangxx."
+          }
+
+          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $llvmBin = Join-Path $llvmRoot "bin"
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          Write-Host "LLVM $env:LLVM_VERSION is ready."
+          Write-Host "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')"
+
+      # Reuse vcpkg already installed on the Windows runner.
+      - name: Restore vcpkg dependency cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\downloads
+          key: vcpkg-windows-2022-x64-static-zstd-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
+          restore-keys: |
+            vcpkg-windows-2022-x64-static-zstd-
+
+      - name: Install zstd dependency
+        shell: pwsh
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:VCPKG_DISABLE_METRICS = "1"
+
+          $vcpkgExe = Join-Path $env:VCPKG_ROOT "vcpkg.exe"
+          $vcpkgToolchain = Join-Path $env:VCPKG_ROOT "scripts/buildsystems/vcpkg.cmake"
+
+          if (-not (Test-Path $vcpkgExe)) {
+            throw "The runner's vcpkg executable was not found: $vcpkgExe"
+          }
+          if (-not (Test-Path $vcpkgToolchain)) {
+            throw "The vcpkg CMake toolchain was not found: $vcpkgToolchain"
+          }
+
+          Write-Host "Using vcpkg at $env:VCPKG_ROOT"
+          & $vcpkgExe version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not query the vcpkg version."
+          }
+
+          Write-Host "Installing zstd:x64-windows-static..."
+          & $vcpkgExe install zstd:x64-windows-static
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg failed to install zstd:x64-windows-static."
+          }
+
+          $zstdConfig = Join-Path $env:VCPKG_ROOT "installed/x64-windows-static/share/zstd/zstdConfig.cmake"
+          if (-not (Test-Path $zstdConfig)) {
+            throw "zstdConfig.cmake was not found at $zstdConfig"
+          }
+
+          Write-Host "zstd dependency is ready."
+
+      - name: Save vcpkg dependency cache
+        if: success() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\downloads
+          key: vcpkg-windows-2022-x64-static-zstd-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
+
+      - name: Locate Visual Studio DIA SDK
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Download the LLVM developer archive. CMath needs the C++ headers,
-          # libraries, and LLVMConfig.cmake, not just the clang installer.
-          $llvmVersion = "23.1.4"
-          $llvmArchiveName = "clang+llvm-$llvmVersion-x86_64-pc-windows-msvc.tar.xz"
-          $llvmUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$llvmVersion/$llvmArchiveName"
-          $llvmArchive = Join-Path $env:RUNNER_TEMP $llvmArchiveName
-          $expectedSha256 = "854bffcfc84528e0ee92490ff5c178920abd358a79c3e98f053e41e3e8e4c6d2"
-
-          Invoke-WebRequest -Uri $llvmUrl -OutFile $llvmArchive
-          $actualSha256 = (Get-FileHash $llvmArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "LLVM archive SHA-256 mismatch. Expected $expectedSha256, got $actualSha256."
-          }
-
-          tar -xf $llvmArchive -C $env:RUNNER_TEMP
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to extract the LLVM developer archive."
-          }
-
-          $llvmRoot = Join-Path $env:RUNNER_TEMP "clang+llvm-$llvmVersion-x86_64-pc-windows-msvc"
-          $llvmConfig = Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"
-          if (-not (Test-Path $llvmConfig)) {
-            throw "LLVMConfig.cmake was not found at $llvmConfig."
-          }
-
-          # Install zstd using the same static x64 triplet used by CMath.
-          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to clone vcpkg."
-          }
-
-          & (Join-Path $vcpkgRoot "bootstrap-vcpkg.bat") -disableMetrics
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to bootstrap vcpkg."
-          }
-
-          & (Join-Path $vcpkgRoot "vcpkg.exe") install zstd:x64-windows-static
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to install zstd:x64-windows-static."
-          }
-
-          # Locate the DIA SDK supplied with the Visual Studio installation.
           $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
           $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio/Installer/vswhere.exe"
+
           if (-not (Test-Path $vswhere)) {
             throw "vswhere.exe was not found at $vswhere."
           }
@@ -82,22 +200,26 @@ jobs:
             throw "Visual Studio DIA SDK was not found at $diaDir."
           }
 
-          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "MSVC_DIA_SDK_DIR=$diaDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          (Join-Path $llvmRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "DIA SDK found at $diaDir"
 
       - name: Configure CMake
         shell: pwsh
+        timeout-minutes: 15
         run: |
+          $ErrorActionPreference = "Stop"
+
+          $clangxx = Join-Path $env:LLVM_ROOT "bin/clang++.exe"
+          $vcpkgToolchain = Join-Path $env:VCPKG_ROOT "scripts/buildsystems/vcpkg.cmake"
+          $zstdDir = Join-Path $env:VCPKG_ROOT "installed/x64-windows-static/share/zstd"
+
           cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64 `
             "-DLLVM_DIR=$env:LLVM_DIR" `
             "-DMSVC_DIA_SDK_DIR=$env:MSVC_DIA_SDK_DIR" `
-            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain" `
             "-DVCPKG_TARGET_TRIPLET=x64-windows-static" `
-            "-Dzstd_DIR=$env:VCPKG_ROOT/installed/x64-windows-static/share/zstd" `
-            "-DCMATH_CLANGXX_EXECUTABLE=clang++"
+            "-Dzstd_DIR=$zstdDir" `
+            "-DCMATH_CLANGXX_EXECUTABLE=$clangxx"
 
           if ($LASTEXITCODE -ne 0) {
             throw "CMake configuration failed."
@@ -105,7 +227,10 @@ jobs:
 
       - name: Build mathmake
         shell: pwsh
+        timeout-minutes: 30
         run: |
+          $ErrorActionPreference = "Stop"
+
           cmake --build build-x64 --config Release --target mathmake --parallel
           if ($LASTEXITCODE -ne 0) {
             throw "The mathmake build failed."
@@ -114,10 +239,13 @@ jobs:
       - name: Verify compiler version
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $version = & .\build-x64\Release\mathmake.exe --version
           if ($LASTEXITCODE -ne 0) {
             throw "mathmake --version failed."
           }
+
           Write-Host $version
           if ($version -notmatch "0\.2") {
             throw "Expected a CMath 0.2 mathmake binary, got: $version"
@@ -125,7 +253,10 @@ jobs:
 
       - name: Run native compiler smoke test
         shell: pwsh
+        timeout-minutes: 10
         run: |
+          $ErrorActionPreference = "Stop"
+
           $output = & .\build-x64\Release\mathmake.exe run .\examples\native_smoke.cmath 2>&1
           $exitCode = $LASTEXITCODE
           $output | ForEach-Object { Write-Host $_ }
@@ -134,17 +265,17 @@ jobs:
             throw "The native compiler smoke test failed with exit code $exitCode."
           }
 
-          # The smoke-test program prints a numeric result. Confirm that the
-          # produced executable ran and emitted that result.
-          $hasNumericOutput = $output | Where-Object { "$_" -match '^\s*[0-9]+(\.[0-9]+)?\s*$' }
-          if (-not $hasNumericOutput) {
-            throw "The native smoke-test executable did not print its expected numeric result."
+          $hasExpectedOutput = $output | Where-Object { "$($_)".Trim() -eq "30" }
+          if (-not $hasExpectedOutput) {
+            throw "The native smoke test did not print its expected result (30)."
           }
 
       - name: Package release files
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = "Stop"
+
           $tag = $env:GITHUB_REF_NAME
           $packageDir = Join-Path $env:RUNNER_TEMP "CMath-release"
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
@@ -157,8 +288,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $examplesDir | Out-Null
           Copy-Item ".\examples\native_smoke.cmath" $examplesDir
 
-          # Include LLVM's shared runtime when this LLVM distribution provides it.
-          $llvmDll = Join-Path $env:LLVM_ROOT "bin\LLVM.dll"
+          if (Test-Path ".\examples\native_functions.cmath") {
+            Copy-Item ".\examples\native_functions.cmath" $examplesDir
+          }
+
+          # Include LLVM's shared runtime if this LLVM distribution provides it.
+          $llvmDll = Join-Path $env:LLVM_ROOT "bin/LLVM.dll"
           if (Test-Path $llvmDll) {
             Copy-Item $llvmDll $packageDir
           }
@@ -167,7 +302,10 @@ jobs:
           Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $archiveName -Force
 
           $sha256 = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
-          [System.IO.File]::WriteAllText("$archiveName.sha256", "$sha256  $archiveName")
+          [System.IO.File]::WriteAllText("$archiveName.sha256", "$sha256  $archiveName`n")
+
+          Write-Host "Created $archiveName"
+          Write-Host "SHA-256: $sha256"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
