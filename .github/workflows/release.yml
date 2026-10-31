@@ -83,14 +83,20 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          # Reconstruct the path: PowerShell variables do not persist between steps.
+          $llvmArchive = Join-Path $env:RUNNER_TEMP "clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst"
+          $tarArchive = Join-Path $env:RUNNER_TEMP "llvm.tar"
+
+          if (-not (Test-Path $llvmArchive)) {
+            throw "LLVM archive not found: $llvmArchive"
+          }
+
           Write-Host "Installing Zstandard decompression support..."
           python -m pip install --disable-pip-version-check --no-warn-script-location zstandard
 
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to install Python zstandard."
           }
-
-          $tarArchive = Join-Path $env:RUNNER_TEMP "llvm.tar"
 
           $env:LLVM_ARCHIVE_PATH = $llvmArchive
           $env:LLVM_TAR_PATH = $tarArchive
@@ -108,7 +114,7 @@ jobs:
               with open(target_path, "wb") as target:
                   zstandard.ZstdDecompressor().copy_stream(source, target)
 
-          print("Decompression complete.")
+          print("LLVM decompression completed.")
           '@ | python -
 
           if ($LASTEXITCODE -ne 0) {
@@ -123,9 +129,6 @@ jobs:
           }
 
           Remove-Item $tarArchive -Force
-          Remove-Item Env:LLVM_ARCHIVE_PATH
-          Remove-Item Env:LLVM_TAR_PATH
-
           Write-Host "LLVM extraction completed successfully."
 
       # Reuse vcpkg already installed on the Windows runner.
