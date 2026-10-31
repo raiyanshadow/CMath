@@ -141,7 +141,7 @@ namespace cmath::language::detail {
         consume(TokenKind::Newline, "Expected a newline before the function body");
         if (!consume(TokenKind::Indent, "Expected an indented function body")) return body;
         while (!check(TokenKind::Dedent) && !check(TokenKind::EndOfFile)) {
-            if (match(TokenKind::NewLine)) continue;
+            if (match(TokenKind::Newline)) continue;
             const auto before = current_;
             body.push_back(parseStatement());
             if (current_ == before) advance();
@@ -217,6 +217,27 @@ namespace cmath::language::detail {
         return expression;
     }
 
+    ExprPtr Parser::parseMultiplicative() {
+        auto expression = parseUnary();
+
+        while (check(TokenKind::Star) ||
+            check(TokenKind::Slash) ||
+            check(TokenKind::Percent)) {
+
+            const Token op = advance();
+            auto right = parseUnary();
+
+            expression = makeExpr(
+                Expr::Kind::Binary,
+                op.lexeme,
+                op.location,
+                {expression, right}
+            );
+        }
+
+        return expression;
+    }
+
     ExprPtr Parser::parseUnary() {
         if (check(TokenKind::Plus) || check(TokenKind::Minus)) {
             const Token op = advance();
@@ -238,7 +259,7 @@ namespace cmath::language::detail {
         auto expression = parsePrimary();
         while (true) {
             if (match(TokenKind::LeftParen)) {
-                std::vector<ExprPtr> children{expressions};
+                std::vector<ExprPtr> children{expression};
                 if (!check(TokenKind::RightParen)) {
                     do {children.push_back(parseExpression());}
                     while (match(TokenKind::Comma));

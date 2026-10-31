@@ -37,38 +37,67 @@ namespace cmath::language::detail {
                                           std::move(message), location, {}});
     }
 
+    
     void Lexer::processIndentation() {
         const SourceLocation start{line_, column_, current_};
+
         std::size_t indentationWidth = 0;
         std::size_t alternateIndentationWidth = 0;
+
         bool sawSpace = false;
         bool sawTab = false;
 
+        // Calculate indentation.
         while (peek() == ' ' || peek() == '\t') {
             if (peek() == ' ') {
                 sawSpace = true;
                 advance();
+
                 ++indentationWidth;
                 ++alternateIndentationWidth;
             } else {
                 sawTab = true;
                 advance();
-                indentationWidth = ((indentationWidth / 4) + 1)*4;
+
+                indentationWidth = ((indentationWidth / 4) + 1) * 4;
                 ++alternateIndentationWidth;
             }
         }
 
-        if (peek() == '\n' || atEnd()) {
-            if (peek() == '#') while (!atEnd() && peek() == '\0') advance();
-            if (peek() == '\n') advance();
+        // Ignore blank lines.
+        if (peek() == '\n') {
+            advance();
             atLineStart_ = true;
             lineHasCode_ = false;
             return;
         }
 
+        // Ignore comment-only lines.
+        if (peek() == '#') {
+            while (!atEnd() && peek() != '\n') {
+                advance();
+            }
+
+            if (peek() == '\n') {
+                advance();
+            }
+
+            atLineStart_ = true;
+            lineHasCode_ = false;
+            return;
+        }
+
+        if (atEnd()) {
+            return;
+        }
+
+        // Detect mixed indentation.
         if (sawSpace && sawTab) {
-            error("AmbiguousIndentError", 
-                    "Avoid using a mix of tabs and spaces in the same indentation prefix.", start);
+            error(
+                "AmbiguousIndentError",
+                "Avoid using a mix of tabs and spaces in the same indentation prefix.",
+                start
+            );
         }
 
         const auto currentIndent = indentation_.back();
@@ -76,30 +105,62 @@ namespace cmath::language::detail {
 
         if (indentationWidth > currentIndent) {
             if (alternateIndentationWidth <= currentAlternateIndent) {
-                error("AmbiguousIndentError",
-                        "Ambiguous indentation: tabs and spaces produce different indentation levels. Use only one indentation style.", start);
-            }
-            indentation_.push_back(indentationWidth);
-            alternateIndentation_.push_back(alternateIndentationWidth);
-            tokens_.push_back(Token{TokenKind::Indent, "", start});
-        } else if (indentationWidth < currentIndent) {
-            while (indentation_.size() > 1 && indentationWidth < indentation_.back()) {
-                indentation_.pop_back();
-                alternateIndentation_.pop_back();
-                tokens_.push_back(Token{TokenKind::Dedent, "", start});
+                error(
+                    "AmbiguousIndentError",
+                    "Ambiguous indentation. Use a consistent indentation style.",
+                    start
+                );
             }
 
-            if (indentationWidth != indentation_.back() ||
-                alternateIndentationWidth != alternateIndentation_.back()) {
-                    error("AmbiguousIndentError",
-                          "Indentation does not match an enclosing block or is ambiguous because tabs and spaces are mixed.", start);
-            } else if (alternateIndentationWidth != currentAlternateIndent) {
-                error("AmbiguousIndentError", 
-                      "Ambiguous indentation: this line aligns visually with an existing block but uses a different combination of tabs and spaces", start);
-            }
-            atLineStart_ = false;
+            indentation_.push_back(indentationWidth);
+            alternateIndentation_.push_back(alternateIndentationWidth);
+
+            tokens_.push_back(
+                Token{TokenKind::Indent, "", start}
+            );
         }
+
+        else if (indentationWidth < currentIndent) {
+            while (
+                indentation_.size() > 1 &&
+                indentationWidth < indentation_.back()
+            ) {
+                indentation_.pop_back();
+                alternateIndentation_.pop_back();
+
+                tokens_.push_back(
+                    Token{TokenKind::Dedent, "", start}
+                );
+            }
+
+            if (indentationWidth != indentation_.back()) {
+                error(
+                    "IndentationError",
+                    "Indentation does not match an enclosing block.",
+                    start
+                );
+            }
+            else if (alternateIndentationWidth != alternateIndentation_.back()) {
+                error(
+                    "AmbiguousIndentError",
+                    "Indentation uses a different combination of tabs and spaces.",
+                    start
+                );
+            }
+        }
+
+        else {
+            if (alternateIndentationWidth != currentAlternateIndent) {
+                error(
+                    "AmbiguousIndentError",
+                    "Indentation style differs from the enclosing block.",
+                    start
+                );
+            }
+        }
+        atLineStart_ = false;
     }
+
 
     void Lexer::scanIdentifier() {
         const std::size_t start = current_ - 1;
@@ -162,7 +223,7 @@ namespace cmath::language::detail {
 
     void Lexer::scanToken() {
         const std::size_t start = current_ - 1;
-        const SourceLocation location{line_, colum_ - 1, start};
+        const SourceLocation location{line_, column_ - 1, start};
         const char c = source_[start];
         auto one = [&](TokenKind kind) {add(kind, start, location);};
 

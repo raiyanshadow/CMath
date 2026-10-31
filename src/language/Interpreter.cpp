@@ -116,7 +116,7 @@ namespace cmath::language::detail {
                 std::size_t consumed = 0;
                 const auto n = std::stoll(text, &consumed);
                 if (consumed != text.size()) throw RuntimeFault(loc, "ParseError", "Invalid numeric literal");
-                return (n, 1);
+                return {n, 1};
             }
             const std::string whole = text.substr(0, dot);
             const std::string fractional = text.substr(dot+1);
@@ -159,7 +159,7 @@ namespace cmath::language::detail {
                 case ValueType::Integer: return static_cast<long double>(std::get<std::int64_t>(value.data));
                 case ValueType::Rational: {
                     const auto r = std::get<RationalValue>(value.data);
-                    creturn static_cast<long double>(r.numerator) / static_cast<long double>(r.denominator);
+                    return static_cast<long double>(r.numerator) / static_cast<long double>(r.denominator);
                 }
                 case ValueType::Real: return static_cast<long double>(std::get<double>(value.data));
                 case ValueType::Complex: return static_cast<long double>(std::get<std::complex<double>>(value.data).real());
@@ -194,8 +194,10 @@ namespace cmath::language::detail {
         if (target == ValueType::Real) {
             if (value.type == ValueType::Integer)
                 return {target, static_cast<double>(std::get<std::int64_t>(value.data))};
-            if (value.type == ValueType::Rational)
+            if (value.type == ValueType::Rational) {
+                const auto r = std::get<RationalValue>(value.data);
                 return {target, static_cast<double>(r.numerator) / static_cast<double>(r.denominator)};
+            }
         }
         if (target == ValueType::Complex) {
             if (value.type == ValueType::Integer) 
@@ -238,6 +240,7 @@ namespace cmath::language::detail {
     }
 
     RuntimeValue Interpreter::evaluate(const IRExprPtr& expression, Environment& environment) {
+        if (!consumeInstruction(expression->location)) return {};
         try {
             switch (expression->kind) {
                 case IRExpression::Kind::Literal: {
@@ -274,7 +277,7 @@ namespace cmath::language::detail {
                         const auto found = current->values.find(expression->text);
                         if (found != current->values.end()) return found->second;
                     } 
-                    throw RuntimeFault(epxression->location, "RuntimeError", "Variable '" + expression->text + "' is not available at runtime");
+                    throw RuntimeFault(expression->location, "RuntimeError", "Variable '" + expression->text + "' is not available at runtime");
                 }
 
                 case IRExpression::Kind::ComplexImaginary:
@@ -314,7 +317,7 @@ namespace cmath::language::detail {
         } catch (const RuntimeFault& fault) {
             runtimeError(fault.location, fault.diagnosticCode, fault.what());
         } catch (const std::exception& exception) {
-            runtimeError{expression->location, "RuntimeError", exception.what()};
+            runtimeError(expression->location, "RuntimeError", exception.what());
         }
         return {};
     }
@@ -596,7 +599,7 @@ namespace cmath::language::detail {
 
         if (name == "sqrt") {
             if (x < 0) throw RuntimeFault(location, "DomainError", "Real square root requires nonnegative argument");
-            return {ValueType::Real, std::sqrt(z)};
+            return {ValueType::Real, std::sqrt(x)};
         }
 
         if (name == "sin") return {ValueType::Real, std::sin(x)};
@@ -651,7 +654,7 @@ namespace cmath::language::detail {
                     if (!diagnostics_.empty()) return {};
                     value = promote(value, statement.type, statement.location);
                     environment.values[statement.name] = value;
-                    environment.mutableBindings[statement.name] = statement.mutableBindings;
+                    environment.mutableBindings[statement.name] = statement.mutableBinding;
                     lastValue_ = format(value);
                     return value;
                 }
@@ -659,7 +662,7 @@ namespace cmath::language::detail {
                 case IRStatement::Kind::Assign: {
                     auto value = evaluate(statement.expression, environment);
                     if (!diagnostics_.empty()) return {};
-                    value = promote(value, statement.type, statement.locations);
+                    value = promote(value, statement.type, statement.location);
                     Environment* target = &environment;
                     while (target && !target->values.contains(statement.name)) target = target->parent;
                     if (!target || !target->mutableBindings[statement.name])

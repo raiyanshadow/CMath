@@ -9,6 +9,7 @@ namespace cmath::language::detail {
 
 namespace cmath {
     class LanguageEngine;
+    class LLVMBackend;
 
     class CompiledProgram {
         public:
@@ -25,5 +26,6 @@ namespace cmath {
 
                 std::shared_ptr<const language::detail::ProgramIR> program_;
                 friend class LanguageEngine; 
+                friend class LLVMBackend;
     };
 }

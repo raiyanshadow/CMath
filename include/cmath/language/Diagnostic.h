@@ -21,7 +21,7 @@ namespace cmath {
         DiagnosticSeverity severity = DiagnosticSeverity::Error;
         std::string code;
         std::string message;
-        SourceLocation location();
+        SourceLocation location{};
         std::vector<std::string> notes;
     };
 }

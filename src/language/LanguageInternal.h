@@ -26,7 +26,7 @@ namespace cmath::language::detail {
     struct Token {
         TokenKind kind = TokenKind::Invalid;
         std::string lexeme;
-        SourceLocation location();
+        SourceLocation location{};
     };
 
     struct LexResult {
@@ -70,7 +70,7 @@ namespace cmath::language::detail {
         enum class Kind {Number, String, Boolean, Identifier, Unary, Binary, Call, Member};
         Kind kind = Kind::Number;
         std::string text;
-        SourceLocation location();
+        SourceLocation location{};
         std::vector<std::shared_ptr<Expr>> children; 
     };
     using ExprPtr = std::shared_ptr<Expr>;
@@ -78,13 +78,13 @@ namespace cmath::language::detail {
     struct ParameterAst {
         std::string name;
         std::string typeName;
-        SourceLocation location();
+        SourceLocation location{};
     };
 
     struct Statement {
         enum class Kind {Variable, Function, Return, Expression, Assignment};
         Kind kind = Kind::Expression;
-        SourceLocation location();
+        SourceLocation location{};
         std::string name;
         std::string typeName;
         bool mutableBinding = false;
@@ -96,7 +96,7 @@ namespace cmath::language::detail {
 
     struct AstProgram {
         std::string defaultDomain;
-        SourceLocation domainLocation();
+        SourceLocation domainLocation{};
         std::vector<Statement> statements;
     };
 
@@ -152,7 +152,7 @@ namespace cmath::language::detail {
         Kind kind = Kind::Literal;
         std::string text;
         ValueType type = ValueType::Error;
-        SourceLocation location();
+        SourceLocation location{};
         std::vector<std::shared_ptr<IRExpression>> children;
     };
     using IRExprPtr = std::shared_ptr<IRExpression>;
@@ -160,7 +160,7 @@ namespace cmath::language::detail {
     struct IRStatement {
         enum class Kind {Declare, Assign, Expression, Return};
         Kind kind = Kind::Expression;
-        SourceLocation location();
+        SourceLocation location{};
         std::string name;
         ValueType type = ValueType::Error;
         bool mutableBinding = false;
@@ -177,7 +177,7 @@ namespace cmath::language::detail {
         std::vector<IRParameter> parameters;
         ValueType returnType = ValueType::Error;
         std::vector<IRStatement> body;
-        SourceLocation location();
+        SourceLocation location{};
     };
 
     struct ProgramIR {
@@ -205,7 +205,7 @@ namespace cmath::language::detail {
             std::vector<std::string> notes = {});
             std::optional<ValueType> resolveType(const std::string& name, const SourceLocation& loc);
             void collectFunctions(const AstProgram& ast);
-            void analyzeFunctions(const Statement& statement);
+            void analyzeFunction(const Statement& statement);
             std::vector<IRStatement> analyzeStatements(const std::vector<Statement>& statements,
                                                         Scope& scope, bool inFunction,
                                                         ValueType returnType, bool& sawReturn);
