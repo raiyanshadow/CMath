@@ -1,0 +1,6 @@
+domain Real
+
+def distance(x: Real, y: Real) -> Real:
+    return sqrt(x^2 + y^2)
+
+print(distance(e, pi))

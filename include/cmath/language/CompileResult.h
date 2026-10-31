@@ -13,7 +13,7 @@ namespace cmath {
 
         [[nodiscard]]
         bool succeeded() const noexcept {
-            return.has_value();
+            return program.has_value();
         }
     };
 }
