@@ -150,7 +150,7 @@ jobs:
 
           Write-Host "LLVM_ROOT=$llvmRoot"
           Write-Host "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')"
-          Write-Host "LLVM extraction completed successfully."
+          Write-Host "LLVM extraction completed successfully.""
 
       # Reuse vcpkg already installed on the Windows runner.
       - name: Restore vcpkg dependency cache
