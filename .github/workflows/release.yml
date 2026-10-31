@@ -112,7 +112,7 @@ jobs:
 
           with open(source_path, "rb") as source:
               with open(target_path, "wb") as target:
-                  zstandard.ZstdDecompressor(
+                  decompressor = zstandard.ZstdDecompressor(
                       max_window_size=2**31
                   ).copy_stream(source, target)
                   decompressor.copy_stream(source, target)
