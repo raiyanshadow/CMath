@@ -1,3 +1,4 @@
+
 name: CMath CI
 
 on:
@@ -7,3 +8,407 @@ on:
   push:
     branches:
       - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cmath-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: "23.1.4"
+  VCPKG_ROOT: "C:\\vcpkg"
+
+jobs:
+  windows-build:
+    name: Build and test CMath (Windows x64)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      # ------------------------------------------
+      # Install LLVM
+      # ------------------------------------------
+
+      - name: Restore LLVM archive cache
+        id: llvm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
+          key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
+
+      - name: Download and verify LLVM
+        shell: pwsh
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $archiveName = "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          $archive = Join-Path $env:RUNNER_TEMP $archiveName
+
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/$archiveName"
+
+          $expected = "1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091"
+
+          if (-not (Test-Path $archive)) {
+            Write-Host "Downloading LLVM $env:LLVM_VERSION..."
+
+            & curl.exe --location --fail --show-error `
+              --retry 5 --retry-all-errors --retry-delay 5 `
+              --connect-timeout 30 --speed-limit 1024 --speed-time 120 `
+              --max-time 1800 --progress-bar `
+              --output $archive $url
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "LLVM download failed."
+            }
+          }
+
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          if ($actual -ne $expected) {
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            throw "LLVM checksum mismatch."
+          }
+
+          Write-Host "LLVM checksum verified."
+
+      - name: Save LLVM archive cache
+        if: success() && steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst
+          key: llvm-23.1.4-windows-x64-1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091
+
+      - name: Extract LLVM
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $archive = Join-Path $env:RUNNER_TEMP "clang+llvm-23.1.4-x86_64-pc-windows-msvc.tar.zst"
+          $tarArchive = Join-Path $env:RUNNER_TEMP "llvm.tar"
+
+          python -m pip install --disable-pip-version-check --no-warn-script-location zstandard
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install Python zstandard."
+          }
+
+          $env:LLVM_ARCHIVE_PATH = $archive
+          $env:LLVM_TAR_PATH = $tarArchive
+
+          @'
+          import os
+          import zstandard
+
+          with open(os.environ["LLVM_ARCHIVE_PATH"], "rb") as source:
+              with open(os.environ["LLVM_TAR_PATH"], "wb") as target:
+                  decompressor = zstandard.ZstdDecompressor(
+                      max_window_size=2**31
+                  )
+                  decompressor.copy_stream(source, target)
+
+          print("LLVM decompression completed.")
+          '@ | python -
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "LLVM decompression failed."
+          }
+
+          tar.exe -xf $tarArchive -C $env:RUNNER_TEMP
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "LLVM extraction failed."
+          }
+
+          Remove-Item $tarArchive -Force
+
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "clang+llvm-23.1.4-x86_64-pc-windows-msvc"
+
+          $clangxx = Join-Path $llvmRoot "bin/clang++.exe"
+          $llvmConfig = Join-Path $llvmRoot "lib/cmake/llvm/LLVMConfig.cmake"
+
+          if (-not (Test-Path $clangxx)) {
+            throw "clang++.exe was not found."
+          }
+
+          if (-not (Test-Path $llvmConfig)) {
+            throw "LLVMConfig.cmake was not found."
+          }
+
+          "LLVM_ROOT=$llvmRoot" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "LLVM_DIR=$(Join-Path $llvmRoot 'lib/cmake/llvm')" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          (Join-Path $llvmRoot "bin") | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
+          Write-Host "LLVM installed successfully."
+
+      # ------------------------------------------
+      # Install vcpkg dependencies
+      # ------------------------------------------
+
+      - name: Restore vcpkg cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\downloads
+          key: vcpkg-windows-2022-x64-static-zstd-zlib-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
+          restore-keys: |
+            vcpkg-windows-2022-x64-static-zstd-zlib-
+
+      - name: Install zstd and zlib
+        shell: pwsh
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:VCPKG_DISABLE_METRICS = "1"
+
+          $vcpkgExe = Join-Path $env:VCPKG_ROOT "vcpkg.exe"
+
+          if (-not (Test-Path $vcpkgExe)) {
+            throw "vcpkg.exe was not found."
+          }
+
+          & $vcpkgExe install zstd:x64-windows-static zlib:x64-windows-static
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg dependency installation failed."
+          }
+
+          $installed = Join-Path $env:VCPKG_ROOT "installed/x64-windows-static"
+
+          $requiredFiles = @(
+            "share/zstd/zstdConfig.cmake",
+            "include/zlib.h",
+            "share/zlib/vcpkg-cmake-wrapper.cmake"
+          )
+
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path (Join-Path $installed $file))) {
+              throw "Missing dependency file: $file"
+            }
+          }
+
+          Write-Host "zstd and zlib are ready."
+
+      - name: Save vcpkg cache
+        if: success() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\downloads
+          key: vcpkg-windows-2022-x64-static-zstd-zlib-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
+
+      # ------------------------------------------
+      # Locate Visual Studio
+      # ------------------------------------------
+
+      - name: Locate Visual Studio DIA SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio/Installer/vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe was not found."
+          }
+
+          $vsInstall = & $vswhere -latest -products "*" -property installationPath
+
+          if ($LASTEXITCODE -ne 0 -or -not $vsInstall) {
+            throw "Visual Studio installation could not be located."
+          }
+
+          $diaDir = Join-Path $vsInstall "DIA SDK"
+
+          if (-not (Test-Path $diaDir)) {
+            throw "Visual Studio DIA SDK was not found."
+          }
+
+          "MSVC_DIA_SDK_DIR=$diaDir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ------------------------------------------
+      # Configure and build CMath
+      # ------------------------------------------
+
+      - name: Configure CMake
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installed = Join-Path $env:VCPKG_ROOT "installed/x64-windows-static"
+          $vcpkgToolchain = Join-Path $env:VCPKG_ROOT "scripts/buildsystems/vcpkg.cmake"
+
+          # Intentionally configure a nonexistent compiler path.
+          # This verifies that mathmake falls back to PATH at runtime.
+          $missingClangxx = "C:/cmath-ci-missing/clang++.exe"
+
+          cmake -S . -B build-x64 `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            "-DLLVM_DIR=$env:LLVM_DIR" `
+            "-DMSVC_DIA_SDK_DIR=$env:MSVC_DIA_SDK_DIR" `
+            "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain" `
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static" `
+            "-Dzstd_DIR=$installed/share/zstd" `
+            "-DZLIB_ROOT=$installed" `
+            "-DCMATH_CLANGXX_EXECUTABLE=$missingClangxx"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configuration failed."
+          }
+
+      - name: Build mathmake
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake --build build-x64 --config Release --target mathmake --parallel
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMath build failed."
+          }
+
+      # ------------------------------------------
+      # Test CLI
+      # ------------------------------------------
+
+      - name: Verify mathmake version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mathmake = ".\build-x64\Release\mathmake.exe"
+
+          $output = & $mathmake --version 2>&1
+          $exitCode = $LASTEXITCODE
+
+          $output | ForEach-Object { Write-Host $_ }
+
+          if ($exitCode -ne 0) {
+            throw "mathmake --version failed."
+          }
+
+          if (($output -join "`n") -notmatch "CMath mathmake 0\.2") {
+            throw "Unexpected mathmake version."
+          }
+
+      - name: Verify CLI optimization options
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mathmake = ".\build-x64\Release\mathmake.exe"
+          $output = & $mathmake --help 2>&1
+          $exitCode = $LASTEXITCODE
+
+          if ($exitCode -ne 0) {
+            throw "mathmake --help failed."
+          }
+
+          $help = $output -join "`n"
+
+          foreach ($option in @("-O0", "-O1", "-O2", "-O3")) {
+            if (-not $help.Contains($option)) {
+              throw "Optimization option $option is missing from help."
+            }
+          }
+
+          Write-Host "CLI help and optimization options verified."
+
+      # ------------------------------------------
+      # Test frontend and native compilation
+      # ------------------------------------------
+
+      - name: Run frontend check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mathmake = ".\build-x64\Release\mathmake.exe"
+
+          Remove-Item Env:CMATH_CLANGXX -ErrorAction SilentlyContinue
+
+          & $mathmake check .\examples\native_smoke.cmath
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Frontend check failed."
+          }
+
+      - name: Run native compiler optimization tests
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mathmake = ".\build-x64\Release\mathmake.exe"
+          $source = ".\examples\native_smoke.cmath"
+
+          Remove-Item Env:CMATH_CLANGXX -ErrorAction SilentlyContinue
+
+          foreach ($optimization in @("-O0", "-O1", "-O2", "-O3")) {
+            Write-Host "Testing $optimization..."
+
+            $output = & $mathmake run $source $optimization 2>&1
+            $exitCode = $LASTEXITCODE
+
+            $output | ForEach-Object { Write-Host $_ }
+
+            if ($exitCode -ne 0) {
+              throw "Native compilation failed with $optimization."
+            }
+
+            $hasExpectedOutput = $output |
+              Where-Object { "$($_)".Trim() -eq "30" }
+
+            if (-not $hasExpectedOutput) {
+              throw "Expected output 30 was not produced with $optimization."
+            }
+          }
+
+          Write-Host "All optimization tests passed."
+
+      - name: Run native function test
+        if: hashFiles('examples/native_functions.cmath') != ''
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mathmake = ".\build-x64\Release\mathmake.exe"
+
+          Remove-Item Env:CMATH_CLANGXX -ErrorAction SilentlyContinue
+
+          $output = & $mathmake run .\examples\native_functions.cmath 2>&1
+          $exitCode = $LASTEXITCODE
+
+          $output | ForEach-Object { Write-Host $_ }
+
+          if ($exitCode -ne 0) {
+            throw "Native function test failed."
+          }
+
+          $hasExpectedOutput = $output |
+            Where-Object { "$($_)".Trim() -eq "5" }
+
+          if (-not $hasExpectedOutput) {
+            throw "Expected output 5 was not produced."
+          }
+
+      - name: CI completed
+        shell: pwsh
+        run: |
+          Write-Host "All CMath CI checks passed."
