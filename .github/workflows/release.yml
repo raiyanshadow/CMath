@@ -1,3 +1,4 @@
+
 name: CMath Release
 
 on:
@@ -26,6 +27,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      # --------------------------------------------------
+      # LLVM
+      # --------------------------------------------------
+
       - name: Restore LLVM archive cache
         id: llvm-cache
         uses: actions/cache/restore@v5
@@ -43,6 +48,7 @@ jobs:
           $llvmArchiveName = "clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
           $llvmUrl = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/$llvmArchiveName"
           $llvmArchive = Join-Path $env:RUNNER_TEMP $llvmArchiveName
+
           $expectedSha256 = "1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091"
 
           if (Test-Path $llvmArchive) {
@@ -50,6 +56,7 @@ jobs:
           }
           else {
             Write-Host "Downloading LLVM $env:LLVM_VERSION developer archive..."
+
             & curl.exe --location --fail --show-error `
               --retry 5 --retry-all-errors --retry-delay 5 `
               --connect-timeout 30 --speed-limit 1024 --speed-time 120 `
@@ -62,6 +69,7 @@ jobs:
           }
 
           Write-Host "Verifying LLVM archive SHA-256..."
+
           $actualSha256 = (Get-FileHash $llvmArchive -Algorithm SHA256).Hash.ToLowerInvariant()
 
           if ($actualSha256 -ne $expectedSha256) {
@@ -92,6 +100,7 @@ jobs:
           }
 
           Write-Host "Installing Zstandard decompression support..."
+
           python -m pip install --disable-pip-version-check --no-warn-script-location zstandard
 
           if ($LASTEXITCODE -ne 0) {
@@ -125,6 +134,7 @@ jobs:
           }
 
           Write-Host "Extracting LLVM files..."
+
           tar.exe -xf $tarArchive -C $env:RUNNER_TEMP
 
           if ($LASTEXITCODE -ne 0) {
@@ -149,6 +159,10 @@ jobs:
 
           Write-Host "LLVM_ROOT=$llvmRoot"
           Write-Host "LLVM extraction completed successfully."
+
+      # --------------------------------------------------
+      # vcpkg dependencies
+      # --------------------------------------------------
 
       - name: Restore vcpkg dependency cache
         id: vcpkg-cache
@@ -182,6 +196,7 @@ jobs:
           Write-Host "Using vcpkg at $env:VCPKG_ROOT"
 
           & $vcpkgExe version
+
           if ($LASTEXITCODE -ne 0) {
             throw "Could not query the vcpkg version."
           }
@@ -212,6 +227,7 @@ jobs:
           }
 
           Write-Host "Installed zlib libraries:"
+
           Get-ChildItem (Join-Path $installedDir "lib") -Filter "*.lib" |
             ForEach-Object { Write-Host "  $($_.Name)" }
 
@@ -225,6 +241,10 @@ jobs:
             C:\vcpkg\installed
             C:\vcpkg\downloads
           key: vcpkg-windows-2022-x64-static-zstd-zlib-${{ hashFiles('cmake/CMathNativeCompiler.cmake') }}
+
+      # --------------------------------------------------
+      # Visual Studio
+      # --------------------------------------------------
 
       - name: Locate Visual Studio DIA SDK
         shell: pwsh
@@ -251,7 +271,12 @@ jobs:
           }
 
           "MSVC_DIA_SDK_DIR=$diaDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
           Write-Host "DIA SDK found at $diaDir"
+
+      # --------------------------------------------------
+      # CMake configuration and build
+      # --------------------------------------------------
 
       - name: Configure CMake
         shell: pwsh
@@ -288,6 +313,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "The mathmake build failed."
           }
+
+      # --------------------------------------------------
+      # Build-directory smoke test
+      # --------------------------------------------------
 
       - name: Verify compiler version
         shell: pwsh
@@ -327,14 +356,22 @@ jobs:
             throw "The native smoke test did not print its expected result (30)."
           }
 
+      # --------------------------------------------------
+      # Package release
+      # --------------------------------------------------
+
       - name: Package release files
         shell: pwsh
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           $ErrorActionPreference = "Stop"
 
           $tag = $env:GITHUB_REF_NAME
           $packageDir = Join-Path $env:RUNNER_TEMP "CMath-release"
+
+          if (Test-Path $packageDir) {
+            Remove-Item $packageDir -Recurse -Force
+          }
 
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 
@@ -351,15 +388,26 @@ jobs:
             Copy-Item ".\examples\native_functions.cmath" $examplesDir
           }
 
-          $llvmDll = Join-Path $env:LLVM_ROOT "bin/LLVM.dll"
+          # Bundle every LLVM runtime DLL from the same LLVM distribution.
+          # The package does not include clang++.exe itself.
+          $llvmBin = Join-Path $env:LLVM_ROOT "bin"
+          $llvmDlls = @(Get-ChildItem -LiteralPath $llvmBin -Filter "*.dll" -File)
 
-          if (Test-Path $llvmDll) {
-            Copy-Item $llvmDll $packageDir
+          foreach ($dll in $llvmDlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination $packageDir -Force
+            Write-Host "Bundled LLVM runtime: $($dll.Name)"
+          }
+
+          if ($llvmDlls.Count -eq 0) {
+            Write-Host "No LLVM runtime DLLs were found; checking the package will validate whether they are needed."
           }
 
           $archiveName = "CMath-$tag-windows-x64.zip"
 
-          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $archiveName -Force
+          Compress-Archive `
+            -Path (Join-Path $packageDir "*") `
+            -DestinationPath $archiveName `
+            -Force
 
           $sha256 = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
 
@@ -370,6 +418,200 @@ jobs:
 
           Write-Host "Created $archiveName"
           Write-Host "SHA-256: $sha256"
+
+      # --------------------------------------------------
+      # Verify the actual distributed package
+      # --------------------------------------------------
+
+      - name: Verify release archive and packaged compiler
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tag = $env:GITHUB_REF_NAME
+          $archiveName = "CMath-$tag-windows-x64.zip"
+          $checksumFile = "$archiveName.sha256"
+
+          # 1. Verify the checksum file against the actual ZIP.
+
+          if (-not (Test-Path $archiveName)) {
+            throw "Release archive was not created: $archiveName"
+          }
+
+          if (-not (Test-Path $checksumFile)) {
+            throw "Release checksum file was not created: $checksumFile"
+          }
+
+          $checksumText = Get-Content -LiteralPath $checksumFile -Raw
+          $checksumMatch = [regex]::Match(
+            $checksumText,
+            '^\s*([0-9a-fA-F]{64})\s+'
+          )
+
+          if (-not $checksumMatch.Success) {
+            throw "The checksum file does not contain a valid SHA-256 value."
+          }
+
+          $expectedSha256 = $checksumMatch.Groups[1].Value.ToLowerInvariant()
+          $actualSha256 = (Get-FileHash $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Release archive checksum mismatch. Expected $expectedSha256, got $actualSha256."
+          }
+
+          Write-Host "Release archive checksum verified: $actualSha256"
+
+          # 2. Extract the actual archive.
+
+          $verifyDir = Join-Path $env:RUNNER_TEMP "CMath-release-verification"
+
+          if (Test-Path $verifyDir) {
+            Remove-Item $verifyDir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+
+          Expand-Archive `
+            -LiteralPath $archiveName `
+            -DestinationPath $verifyDir `
+            -Force
+
+          $packagedMathmake = Join-Path $verifyDir "mathmake.exe"
+          $smokeSource = Join-Path $verifyDir "examples/native_smoke.cmath"
+
+          $requiredFiles = @(
+            $packagedMathmake,
+            (Join-Path $verifyDir "README.md"),
+            (Join-Path $verifyDir "LICENSE"),
+            $smokeSource
+          )
+
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              throw "Required release package file is missing: $file"
+            }
+          }
+
+          Write-Host "Required release package files are present."
+
+          # 3. Test startup without LLVM on PATH.
+          # DLL dependencies must be available beside mathmake.exe
+          # or in Windows system directories.
+
+          $originalPath = $env:PATH
+
+          try {
+            $env:PATH = Join-Path $env:SystemRoot "System32"
+
+            $versionOutput = & $packagedMathmake --version 2>&1
+            $versionExitCode = $LASTEXITCODE
+
+            $versionOutput | ForEach-Object { Write-Host $_ }
+
+            if ($versionExitCode -ne 0) {
+              throw "Packaged mathmake failed to start or report its version without LLVM on PATH."
+            }
+
+            if (($versionOutput -join "`n") -notmatch "CMath mathmake 0\.2") {
+              throw "Packaged mathmake returned an unexpected version."
+            }
+
+            # The check command must work without clang++.
+            $checkOutput = & $packagedMathmake check $smokeSource 2>&1
+            $checkExitCode = $LASTEXITCODE
+
+            $checkOutput | ForEach-Object { Write-Host $_ }
+
+            if ($checkExitCode -ne 0) {
+              throw "Packaged mathmake check failed without LLVM on PATH."
+            }
+
+          }
+          finally {
+            $env:PATH = $originalPath
+          }
+
+          Write-Host "Packaged compiler startup and check tests passed."
+
+          # 4. Relocate LLVM to simulate a different installation path.
+          # This invalidates the path embedded during the CMake build.
+          # With CMATH_CLANGXX unset, mathmake must discover clang++
+          # through PATH instead.
+
+          $originalLlvmRoot = $env:LLVM_ROOT
+          $relocatedLlvmRoot = "$originalLlvmRoot-package-test"
+          $relocatedLlvmBin = Join-Path $relocatedLlvmRoot "bin"
+
+          $originalPath = $env:PATH
+          $hadClangxx = Test-Path Env:CMATH_CLANGXX
+          $originalClangxx = $env:CMATH_CLANGXX
+
+          if (-not (Test-Path $originalLlvmRoot)) {
+            throw "Original LLVM directory does not exist: $originalLlvmRoot"
+          }
+
+          if (Test-Path $relocatedLlvmRoot) {
+            throw "LLVM relocation destination already exists: $relocatedLlvmRoot"
+          }
+
+          try {
+            Move-Item `
+              -LiteralPath $originalLlvmRoot `
+              -Destination $relocatedLlvmRoot
+
+            $env:PATH = "$relocatedLlvmBin;$originalPath"
+
+            Remove-Item Env:CMATH_CLANGXX -ErrorAction SilentlyContinue
+
+            $nativeOutputPath = Join-Path $verifyDir "native_smoke.exe"
+
+            $nativeOutput = & $packagedMathmake run $smokeSource -o $nativeOutputPath 2>&1
+            $nativeExitCode = $LASTEXITCODE
+
+            $nativeOutput | ForEach-Object { Write-Host $_ }
+
+            if ($nativeExitCode -ne 0) {
+              throw "Packaged native compilation failed after relocating LLVM (exit code $nativeExitCode)."
+            }
+
+            if (-not (Test-Path $nativeOutputPath)) {
+              throw "Packaged compiler did not produce the expected native executable."
+            }
+
+            $hasExpectedOutput = $nativeOutput |
+              Where-Object { "$($_)".Trim() -eq "30" }
+
+            if (-not $hasExpectedOutput) {
+              throw "Packaged native smoke test did not print its expected result (30)."
+            }
+
+            Write-Host "Packaged compiler successfully discovered clang++ through PATH."
+
+          }
+          finally {
+            $env:PATH = $originalPath
+
+            if ($hadClangxx) {
+              $env:CMATH_CLANGXX = $originalClangxx
+            }
+            else {
+              Remove-Item Env:CMATH_CLANGXX -ErrorAction SilentlyContinue
+            }
+
+            # Restore the original LLVM directory.
+            if (Test-Path $relocatedLlvmRoot) {
+              Move-Item `
+                -LiteralPath $relocatedLlvmRoot `
+                -Destination $originalLlvmRoot
+            }
+          }
+
+          Write-Host "All distributed package verification tests passed."
+
+      # --------------------------------------------------
+      # Publish
+      # --------------------------------------------------
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
