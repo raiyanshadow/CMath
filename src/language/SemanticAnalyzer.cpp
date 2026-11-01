@@ -215,6 +215,41 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
             return makeIR(IRExpression::Kind::Unary, expression->text, operand->type,
                           expression->location, {operand});
         }
+        case Expr::Kind::PrefixIncrement:
+        case Expr::Kind::PostfixIncrement:
+        case Expr::Kind::PrefixDecrement:
+        case Expr::Kind::PostfixDecrement: {
+            const bool postfix = expression->kind == Expr::Kind::PostfixIncrement || expression->kind == Expr::Kind::PostfixDecrement;
+
+            if (expression->children.empty() || expression->children.front()->kind != Expr::Kind::Identifier) {
+                error(expression->location, "TypeError", "Increment and decremen requires mutable variable");
+                auto invalid = makeIR(IRExpression::Kind::Increment, expression->text, ValueType::Error, expression->location);
+                invalid->postfix = postfix;
+                return invalid;
+            }
+
+            const auto& target = expression->children.front();
+            const auto found = scope.find(target->text);
+
+            if (found == scope.end()) {
+                error(expression->location, "NameError", "Cannot incrememnt or decrement unknown variable '" + target->text + "'");
+                return makeIR(IRExpression::Kind::Increment, expression->text, ValueType::Error, expression->location);
+            }
+
+            if (!found->second.mutableBinding) {
+                error(expression->location, "MutabilityError", "Cannot increment or decrement immutable variable '" + target->text + "'");
+            }
+
+            if (!isNumeric(found->second.type)) {
+                error(expression->location, "TypeError", "Increment and decrement require a numeric variable");
+            }
+
+            auto variable = makeIR(IRExpression::Kind::Variable, target->text, found->second.type, target->location);
+            auto result = makeIR(IRExpression::Kind::Increment, expression->text, found->second.type, expression->location, {variable});
+
+            result->postfix = postfix;
+            return result;
+        }
         case Expr::Kind::Binary: {
             auto left = analyzeExpression(expression->children[0], scope);
             auto right = analyzeExpression(expression->children[1], scope);
@@ -400,11 +435,14 @@ std::vector<IRStatement> SemanticAnalyzer::analyzeStatements(
             case Statement::Kind::Assignment: {
                 auto found = scope.find(statement.name);
                 if (found == scope.end()) {
-                    error(statement.location, "RuntimeError", "Cannot assign to undeclared variable '" + statement.name + "'");
+                    error(statement.location, "NameError", "Cannot assign to undeclared variable '" + statement.name + "'");
                     break;
                 }
                 if (!found->second.mutableBinding)
-                    error(statement.location, "RuntimeError", "Cannot reassign immutable binding '" + statement.name + "'; declare it with 'var'");
+                    error(statement.location, "MutabilityError", "Cannot reassign immutable binding '" + statement.name + "'; declare it with 'var'");
+
+                ExprPtr valueExpression = statement.expression;
+
                 auto value = analyzeExpression(statement.expression, scope);
                 if (!canWiden(value->type, found->second.type))
                     error(statement.expression->location, "RuntimeError", "Cannot assign " + typeName(value->type) +

@@ -79,7 +79,7 @@ namespace cmath::language::detail {
             std::int64_t left = 0, right = 0, numerator = 0, denominator = 0;
             if (!checkedMul(a.numerator, leftFactor, left) || 
                 !checkedMul(b.numerator, rightFactor, right) ||
-                !checkedMul(left, right, numerator) ||
+                !checkedAdd(left, right, numerator) ||
                 !checkedMul(a.denominator, leftFactor, denominator))
                 throw RuntimeFault(loc, "MemoryError", "Rational arithmetic overflows supported 64-bit range");
             return normalizeRational(numerator, denominator, loc);
@@ -348,7 +348,7 @@ namespace cmath::language::detail {
         if (op == "+" && leftValue.type == ValueType::String && rightValue.type == ValueType::String) 
             return {ValueType::String, std::get<std::string>(leftValue.data) + std::get<std::string>(rightValue.data)};
         
-        if (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">=") {
+        if (op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=") {
             bool result = false;
             if (isNumeric(leftValue.type) && isNumeric(rightValue.type)) {
                 const auto common = leftValue.type == ValueType::Complex || rightValue.type == ValueType::Complex

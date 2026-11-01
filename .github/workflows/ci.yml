@@ -270,16 +270,27 @@ jobs:
             throw "CMake configuration failed."
           }
 
-      - name: Build mathmake
+      - name: Build CMath and tests
         shell: pwsh
         timeout-minutes: 30
         run: |
           $ErrorActionPreference = "Stop"
 
-          cmake --build build-x64 --config Release --target mathmake --parallel
+          cmake --build build-x64 --config Release --target mathmake cmath-language-tests --parallel
 
           if ($LASTEXITCODE -ne 0) {
-            throw "CMath build failed."
+            throw "CMath build or test compilation failed."
+          }
+
+      - name: Run CMath language tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          ctest --test-dir build-x64 -C Release --output-on-failure
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMath language tests failed."
           }
 
       # ------------------------------------------

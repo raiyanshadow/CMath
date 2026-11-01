@@ -94,7 +94,7 @@ namespace cmath::language::detail {
         statement.mutableBinding = keyword.kind == TokenKind::Var;
         if (match(TokenKind::Colon)) {
             const Token type = peek();
-            if (!consume(TokenKind::Identifier, "Expected a type name after ':'"))
+            if (consume(TokenKind::Identifier, "Expected a type name after ':'"))
                 statement.typeName = type.lexeme;
         }
         if (!consume(TokenKind::Equal, "Expected '=' in variable declaration")) synchronize();
@@ -279,7 +279,7 @@ namespace cmath::language::detail {
     ExprPtr Parser::parsePrimary() {
         const Token token = peek();
         if (match(TokenKind::Number)) return makeExpr(Expr::Kind::Number, token.lexeme, token.location);
-        if (match(TokenKind::String)) return makeExpr(Expr::Kind::Boolean, token.lexeme, token.location);
+        if (match(TokenKind::String)) return makeExpr(Expr::Kind::String, token.lexeme, token.location);
         if (match(TokenKind::True)) return makeExpr(Expr::Kind::Boolean, "true", token.location);
         if (match(TokenKind::False)) return makeExpr(Expr::Kind::Boolean, "false", token.location);
         if (match(TokenKind::Identifier)) return makeExpr(Expr::Kind::Identifier, token.lexeme, token.location);

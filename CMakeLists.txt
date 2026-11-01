@@ -53,3 +53,33 @@ if(TARGET mathmake)
     )
 endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(cmath-language-tests
+        tests/LanguageTests.cpp
+    )
+
+    target_compile_features(cmath-language-tests
+        PRIVATE cxx_std_20
+    )
+
+    target_link_libraries(cmath-language-tests
+        PRIVATE CMath::Language
+    )
+
+    if(MSVC)
+        target_compile_options(cmath-language-tests
+            PRIVATE /W4 /permissive-
+        )
+    else()
+        target_compile_options(cmath-language-tests
+            PRIVATE -Wall -Wextra -Wpedantic
+        )
+    endif()
+
+    add_test(
+        NAME cmath-language-tests
+        COMMAND cmath-language-tests
+    )
+endif()

@@ -236,12 +236,33 @@ namespace cmath::language::detail {
                 lineHasCode_ = false;
                 atLineStart_ = true;
                 return;
-            case '+': one(TokenKind::Plus); break;
-            case '-': if (match('>')) one(TokenKind::Arrow); else one(TokenKind::Minus); break;
-            case '*': one(TokenKind::Star); break;
-            case '/': one(TokenKind::Slash); break;
-            case '%': one(TokenKind::Percent); break;
-            case '^': one(TokenKind::Caret); break;
+            case '+':
+                if (match('+')) one(TokenKind::PlusPlus);
+                else if (match('=')) one(TokenKind::PlusEqual); 
+                else one(TokenKind::Plus); break;
+                break;
+            case '-': 
+                if (match('>')) one(TokenKind::Arrow); 
+                else if (match('=')) one(TokenKind::MinusEqual);
+                else if (match('-')) one(TokenKind::MinusMinus);
+                else one(TokenKind::Minus); 
+                break;
+            case '*': 
+                if (match('=')) one(TokenKind::StarEqual);
+                else one(TokenKind::Star); 
+                break;
+            case '/':
+                if (match('=')) one(TokenKind::MinusEqual); 
+                else one(TokenKind::Slash); 
+                break;
+            case '%': 
+                if (match('=')) one(TokenKind::PercentEqual);
+                else one(TokenKind::Percent); 
+                break;
+            case '^': 
+                if (match('=')) one(TokenKind::CaretEqual);
+                else one(TokenKind::Caret); 
+                break;
             case '=': if (match('=')) one(TokenKind::EqualEqual); else one(TokenKind::Equal); break;
             case '!': if (match('=')) one(TokenKind::NotEqual); else {one(TokenKind::Invalid); error("SyntaxError", "Expected '=' after '!'.", location);} break;
             case '<': if (match('=')) one(TokenKind::LessEqual); else one(TokenKind::Less); break;

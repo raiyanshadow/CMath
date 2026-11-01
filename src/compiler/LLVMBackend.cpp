@@ -571,6 +571,34 @@ private:
 
                 return nullptr;
 
+            case IRExpression::Kind::Increment: {
+                if (expression->children.empty() ||
+                    expression->children.front()->kind != IRExpression::Kind::Variable) {
+                    error(expression->location, "CompileError", "Invalid increment/decrement target");
+                    return nullptr;
+                }
+
+                const std::string& name = expression->children.front()->text;
+                const auto found = variables_.find(name);
+
+                if (found == variables_.end()) {
+                    error(expression->location, "CompileError", "Increment/decrement target '" + name +  "' is unavailable in this native function.");
+                    return nullptr;
+                }
+                
+                const bool increment = expression->text == "++";
+                auto *previous = builder_.CreateLoad(found->second.type, found->second.address, name  + ".increment.old");
+
+                llvm::Value* updated = nullptr;
+
+                if (found->second.typeKind == ValueType::Integer) {
+                    auto* limit = llvm::ConstantInt::getSigned(
+                        builder_.getInt64Ty(), increment ? std::numeric_limits<std::int64_t>::max() : std::numeric_limits<std::int64_t>::min()
+                    );
+                    auto* overflow = builder_.CreateICmpEQ(previous, limit);
+                }
+            }
+
             case IRExpression::Kind::Unary: {
                 const auto operandType =
                     expression->children.front()->type;
