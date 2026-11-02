@@ -308,7 +308,7 @@ namespace cmath::language::detail {
             std::optional<ValueType> resolveType(const std::string& name, const SourceLocation& loc);
             void collectFunctions(const AstProgram& ast);
             void analyzeFunction(const Statement& statement);
-            std::vector<IRStatement> analyzeStatements(const AstBlock& statements,
+            std::vector<IRStatement> analyzeStatements(const AstBlock& block,
                                                         Scope& parentScope, bool inFunction,
                                                         ValueType returnType, std::size_t loopDepth);
             IRExprPtr analyzeExpression(const ExprPtr& expression, const Scope& scope);
