@@ -252,7 +252,7 @@ namespace cmath::language::detail {
                 else one(TokenKind::Star); 
                 break;
             case '/':
-                if (match('=')) one(TokenKind::MinusEqual); 
+                if (match('=')) one(TokenKind::SlashEqual); 
                 else one(TokenKind::Slash); 
                 break;
             case '%': 

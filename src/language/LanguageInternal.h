@@ -21,7 +21,8 @@ namespace cmath::language::detail {
         PlusPlus, MinusMinus, PlusEqual, MinusEqual, StarEqual, SlashEqual, PercentEqual, CaretEqual,
         Equal, EqualEqual, NotEqual, Less, Greater, LessEqual, GreaterEqual,
         LeftParen, RightParen, Comma, Colon, Dot, Arrow,
-        Newline, Indent, Dedent, EndOfFile, Invalid
+        Newline, Indent, Dedent, EndOfFile, Invalid,
+        Range, If, Elif, Else, While, For, Break, Continue, And, Or, Not, DotDot
     };
 
     struct Token {
@@ -82,8 +83,27 @@ namespace cmath::language::detail {
         SourceLocation location{};
     };
 
+    struct AstBlock;
+
+    struct AstBranch {
+        ExprPtr condition;
+        std::shared_ptr<AstBlock> body;
+        SourceLocation location{};
+    };
+
     struct Statement {
-        enum class Kind {Variable, Function, Return, Expression, Assignment};
+        enum class Kind {
+            Variable, 
+            Function, 
+            Return, 
+            Expression, 
+            Assignment,
+            If,
+            While,
+            For,
+            Break,
+            Continue
+        };
         Kind kind = Kind::Expression;
         SourceLocation location{};
         std::string name;
@@ -92,14 +112,21 @@ namespace cmath::language::detail {
         ExprPtr expression;
         std::vector<ParameterAst> parameters;
         std::string returnType;
-        std::vector<Statement> body;
+        std::shared_ptr<AstBlock> body;
         std::string assignmentOperator = "=";
+        std::vector<AstBranch> branches;
+        std::shared_ptr<AstBlock> elseBody;
+    };
+
+    struct AstBlock {
+        std::vector<Statement> statements;
+        SourceLocation location{};
     };
 
     struct AstProgram {
         std::string defaultDomain;
         SourceLocation domainLocation{};
-        std::vector<Statement> statements;
+        AstBlock body;
     };
 
     struct ParseResult {
@@ -160,32 +187,101 @@ namespace cmath::language::detail {
     };
     using IRExprPtr = std::shared_ptr<IRExpression>;
 
-    struct IRStatement {
-        enum class Kind {Declare, Assign, Expression, Return};
-        Kind kind = Kind::Expression;
-        SourceLocation location{};
-        std::string name;
-        ValueType type = ValueType::Error;
-        bool mutableBinding = false;
-        IRExprPtr expression;
-    };
-
     struct IRParameter {
         std::string name;
         ValueType type = ValueType::Error;
+    };
+
+    struct FlowSummary {
+        bool canFallThrough = true;
+        bool mayReturn = false;
+        bool mayBreak = false;
+        bool mayContinue = false;
+    };
+
+    struct IRBlock;
+
+    struct IRDeclaration {
+        std::string name;
+        ValueType type;
+        bool mutableBinding;
+        IRExprPtr initializer;
+    };
+
+    struct IRAssignment {
+        std::string name;
+        ValueType type;
+        IRExprPtr expression;
+    };
+
+    struct IRExpressionStatement {
+        IRExprPtr expression;
+    };
+
+    struct IRReturn {
+        ValueType type;
+        IRExprPtr expression;
+    };
+
+    struct IRIfBranch {
+        IRExprPtr condition;
+        std::shared_ptr<IRBlock> body;
+    };
+
+    struct IRIf {
+        std::vector<IRIfBranch> branches;
+        std::shared_ptr<IRBlock> elseBody;
+    };
+
+    struct IRWhile {
+        IRExprPtr condition;
+        std::shared_ptr<IRBlock> body;
+    };
+
+    struct IRFor {
+        std::string iterator;
+        IRExprPtr start;
+        IRExprPtr end;
+        std::shared_ptr<IRBlock> body;
+    };
+
+    struct IRBreak {};
+    struct IRContinue {};
+
+    using IRStatementData = std::variant<
+        IRDeclaration,
+        IRAssignment,
+        IRExpressionStatement,
+        IRReturn,
+        IRIf,
+        IRWhile,
+        IRFor,
+        IRBreak,
+        IRContinue
+    >;
+
+    struct IRStatement {
+        SourceLocation location;
+        IRStatementData data;
+    };
+
+    struct IRBlock {
+        SourceLocation location{};
+        std::vector<IRStatement> statements;
+        FlowSummary flow{};
     };
 
     struct IRFunction {
         std::string name;
         std::vector<IRParameter> parameters;
         ValueType returnType = ValueType::Error;
-        std::vector<IRStatement> body;
+        IRBlock body;
         SourceLocation location{};
     };
 
     struct ProgramIR {
         std::string defaultDomain;
-        std::vector<IRStatement> statements;
+        IRBlock body;
         std::unordered_map<std::string, IRFunction> functions;
     };
 
@@ -201,7 +297,10 @@ namespace cmath::language::detail {
 
         private:
             struct SymbolInfo {ValueType type; bool mutableBinding;};
-            using Scope = std::unordered_map<std::string, SymbolInfo>;
+            struct Scope {
+                Scope* parent = nullptr;
+                std::unordered_map<std::string, SymbolInfo> symbols;
+            };
             struct FunctionSignature {std::vector<ValueType> parameters; ValueType result;};
 
             void error(const SourceLocation& location, std::string code, std::string message,
@@ -209,9 +308,9 @@ namespace cmath::language::detail {
             std::optional<ValueType> resolveType(const std::string& name, const SourceLocation& loc);
             void collectFunctions(const AstProgram& ast);
             void analyzeFunction(const Statement& statement);
-            std::vector<IRStatement> analyzeStatements(const std::vector<Statement>& statements,
-                                                        Scope& scope, bool inFunction,
-                                                        ValueType returnType, bool& sawReturn);
+            std::vector<IRStatement> analyzeStatements(const AstBlock& statements,
+                                                        Scope& parentScope, bool inFunction,
+                                                        ValueType returnType, std::size_t loopDepth);
             IRExprPtr analyzeExpression(const ExprPtr& expression, const Scope& scope);
             IRExprPtr makeIR(IRExpression::Kind kind, std::string text, ValueType type,
                             const SourceLocation& location, std::vector<IRExprPtr> children = {});
@@ -224,7 +323,7 @@ namespace cmath::language::detail {
             std::vector<Diagnostic> diagnostics_;
             std::unordered_map<std::string, FunctionSignature> signatures_;
             std::unordered_map<std::string, IRFunction> functions_;
-            std::unordered_map<std::string, SymbolInfo> globals_;
+            Scope globals_;
             std::string defaultDomain_;
     };
 
@@ -258,11 +357,21 @@ namespace cmath::language::detail {
                 Environment* parent = nullptr;
             };
 
-            struct ReturnSignal {RuntimeValue value;};
+            enum class ControlFlow {
+                Normal,
+                Return,
+                Break,
+                Continue
+            };
+
+            struct StatementExecutionResult {
+                ControlFlow flow = ControlFlow::Normal;
+                RuntimeValue value{};
+            };
 
             RuntimeValue evaluate(const IRExprPtr& expression, Environment& environment);
-            RuntimeValue executeStatement(const IRStatement& statement, Environment& environment,
-                                            bool& sawReturn);   
+            StatementExecutionResult executeStatement(const IRStatement& statement, Environment& environment);   
+            StatementExecutionResult executeBlock(const IRBlock& block, Environment& environment);
             RuntimeValue callFunction(const std::string& name,
                                       const std::vector<RuntimeValue>& arguments,
                                       const SourceLocation& location);
