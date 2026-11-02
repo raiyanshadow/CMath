@@ -162,25 +162,58 @@ namespace cmath::language::detail {
     }
 
     Statement Parser::parseAssignmentOrExpression() {
-        if (check(TokenKind::Identifier) && peek(1).kind == TokenKind::Equal) {
+        auto isAssignmentOperator = [](TokenKind kind) {
+            return kind == TokenKind::Equal ||
+                kind == TokenKind::PlusEqual ||
+                kind == TokenKind::MinusEqual ||
+                kind == TokenKind::StarEqual ||
+                kind == TokenKind::SlashEqual ||
+                kind == TokenKind::PercentEqual ||
+                kind == TokenKind::CaretEqual;
+        };
+
+        if (check(TokenKind::Identifier) &&
+            isAssignmentOperator(peek(1).kind)) {
+
             const Token name = advance();
-            advance();
+            const Token op = advance();
+
             Statement statement;
             statement.kind = Statement::Kind::Assignment;
             statement.location = name.location;
             statement.name = name.lexeme;
+            statement.assignmentOperator = op.lexeme;
             statement.expression = parseExpression();
-            if (!check(TokenKind::Newline) && !check(TokenKind::Dedent) && !check(TokenKind::EndOfFile))
-                statement.expression = parseExpression();
+
+            if (!check(TokenKind::Newline) &&
+                !check(TokenKind::Dedent) &&
+                !check(TokenKind::EndOfFile)) {
+                error(
+                    peek(),
+                    "ParseError",
+                    "Unexpected token after assignment expression"
+                );
+            }
+
             match(TokenKind::Newline);
             return statement;
         }
+
         Statement statement;
         statement.kind = Statement::Kind::Expression;
         statement.location = peek().location;
         statement.expression = parseExpression();
-        if (!check(TokenKind::Newline) && !check(TokenKind::Dedent) && !check(TokenKind::EndOfFile))
-            error(peek(), "ParseError", "Unexpected token after expression");
+
+        if (!check(TokenKind::Newline) &&
+            !check(TokenKind::Dedent) &&
+            !check(TokenKind::EndOfFile)) {
+            error(
+                peek(),
+                "ParseError",
+                "Unexpected token after expression"
+            );
+        }
+
         match(TokenKind::Newline);
         return statement;
     }
@@ -239,6 +272,16 @@ namespace cmath::language::detail {
     }
 
     ExprPtr Parser::parseUnary() {
+        if (match(TokenKind::PlusPlus)) {
+            const Token op = tokens_[current_- 1];
+            return makeExpr(Expr::Kind::PrefixIncrement, op.lexeme, op.location, {parseUnary()});
+        }
+
+        if (match(TokenKind::MinusMinus)) {
+            const Token op = tokens_[current_ - 1];
+            return makeExpr(Expr::Kind::PrefixDecrement, op.lexeme, op.location, {parseUnary()});
+        }
+
         if (check(TokenKind::Plus) || check(TokenKind::Minus)) {
             const Token op = advance();
             return makeExpr(Expr::Kind::Unary, op.lexeme, op.location, {parseUnary()});
@@ -271,6 +314,12 @@ namespace cmath::language::detail {
                 const Token member = peek();
                 if (!consume(TokenKind::Identifier, "Expected a member name after '.'")) break;
                 expression = makeExpr(Expr::Kind::Member, member.lexeme, member.location, {expression});
+            } else if (match(TokenKind::PlusPlus)) {
+                const Token op = tokens_[current_ - 1];
+                expression = makeExpr(Expr::Kind::PostfixIncrement, op.lexeme, op.location, {expression});
+            } else if (match(TokenKind::MinusMinus)) {
+                const Token op = tokens_[current_ - 1];
+                expression = makeExpr(Expr::Kind::PostfixDecrement, op.lexeme, op.location, {expression});
             } else break;
         }
         return expression;

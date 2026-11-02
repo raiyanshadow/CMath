@@ -18,6 +18,7 @@ namespace cmath::language::detail {
         Identifier, Number, String, 
         Let, Var, Def, Return, Domain, True, False,
         Plus, Minus, Star, Slash, Percent, Caret,
+        PlusPlus, MinusMinus, PlusEqual, MinusEqual, StarEqual, SlashEqual, PercentEqual, CaretEqual,
         Equal, EqualEqual, NotEqual, Less, Greater, LessEqual, GreaterEqual,
         LeftParen, RightParen, Comma, Colon, Dot, Arrow,
         Newline, Indent, Dedent, EndOfFile, Invalid
@@ -67,7 +68,7 @@ namespace cmath::language::detail {
     };
 
     struct Expr {
-        enum class Kind {Number, String, Boolean, Identifier, Unary, Binary, Call, Member};
+        enum class Kind {Number, String, Boolean, Identifier, Unary, Binary, Call, Member, PrefixIncrement, PostfixIncrement, PrefixDecrement, PostfixDecrement};
         Kind kind = Kind::Number;
         std::string text;
         SourceLocation location{};
@@ -92,6 +93,7 @@ namespace cmath::language::detail {
         std::vector<ParameterAst> parameters;
         std::string returnType;
         std::vector<Statement> body;
+        std::string assignmentOperator = "=";
     };
 
     struct AstProgram {
@@ -148,12 +150,13 @@ namespace cmath::language::detail {
     bool canWiden(ValueType from, ValueType to);
 
     struct IRExpression {
-        enum class Kind {Literal, Variable, Unary, Binary, Call, ComplexImaginary};
+        enum class Kind {Literal, Variable, Unary, Binary, Increment, Call, ComplexImaginary};
         Kind kind = Kind::Literal;
         std::string text;
         ValueType type = ValueType::Error;
         SourceLocation location{};
         std::vector<std::shared_ptr<IRExpression>> children;
+        bool postfix = false;
     };
     using IRExprPtr = std::shared_ptr<IRExpression>;
 

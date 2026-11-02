@@ -10,6 +10,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -596,7 +597,29 @@ private:
                         builder_.getInt64Ty(), increment ? std::numeric_limits<std::int64_t>::max() : std::numeric_limits<std::int64_t>::min()
                     );
                     auto* overflow = builder_.CreateICmpEQ(previous, limit);
+                    emitAbortIf(overflow, expression->location, "Integer increment/decrement overflow");
+                    updated = increment ? builder_.CreateAdd(previous, builder_.getInt64(1), "integer.increment") : builder_.CreateSub(previous, builder_.getInt64(1), "integer.decrement");
+                } else if (found->second.typeKind == ValueType::Real) {
+                    const auto one = llvm::ConstantFP::get(builder_.getDoubleTy(), 1.0);
+                    updated = increment ? builder_.CreateFAdd(previous, one, "real.increment") : builder_.CreateFSub(previous, one, "real.decrement");
+
+                    const auto maximum = llvm::ConstantFP::get(builder_.getDoubleTy(), std::numeric_limits<double>::max());
+                    const auto minimum = llvm::ConstantFP::get(builder_.getDoubleTy(), -std::numeric_limits<double>::max());
+
+                    auto *finiteUpper = builder_.CreateFCmpOLE(updated, maximum);
+                    auto *finiteLower = builder_.CreateFCmpOGE(updated, minimum);
+                    auto *finite = builder_.CreateAnd(finiteUpper, finiteLower);
+
+                    emitAbortIf(builder_.CreateNot(finite), expression->location, "Real increment/decrement produced a non-finite value");
+                } else {
+                    error(expression->location, "FeatuerError", "Realtive increment/decrement currently supports Integer and Real variables");
+                    return nullptr;
                 }
+
+                builder_.CreateStore(updated, found->second.address);
+                llvm::Value* result = expression->postfix ? previous : updated;
+
+                return coerce(result, found->second.typeKind, effectiveType, expression->location);
             }
 
             case IRExpression::Kind::Unary: {
@@ -921,13 +944,191 @@ private:
             }
 
             if (op == "^") {
-                error(
-                    expression->location,
-                    "FeatureError",
-                    "Integer exponentiation is not yet supported by the native backend. Convert the base to Real to use pow()"
+                // Integer exponentiation requires a nonnegative exponent.
+                auto* negativeExponent = builder_.CreateICmpSLT(
+                    right,
+                    builder_.getInt64(0),
+                    "integer.power.negative"
                 );
 
-                return nullptr;
+                emitAbortIf(
+                    negativeExponent,
+                    expression->location,
+                    "Negative Integer exponent"
+                );
+
+                auto* function = builder_.GetInsertBlock()->getParent();
+
+                auto* preheader = builder_.GetInsertBlock();
+
+                auto* loopBlock = llvm::BasicBlock::Create(
+                    context_,
+                    "integer.power.loop",
+                    function
+                );
+
+                auto* bodyBlock = llvm::BasicBlock::Create(
+                    context_,
+                    "integer.power.body",
+                    function
+                );
+
+                auto* exitBlock = llvm::BasicBlock::Create(
+                    context_,
+                    "integer.power.exit",
+                    function
+                );
+
+                auto* multiplyWithOverflow = llvm::Intrinsic::getOrInsertDeclaration(
+                    module_.get(),
+                    llvm::Intrinsic::smul_with_overflow,
+                    {builder_.getInt64Ty()}
+                );
+
+                const auto one = builder_.getInt64(1);
+                const auto zero = builder_.getInt64(0);
+
+                // Enter the exponentiation loop.
+                builder_.CreateBr(loopBlock);
+
+                builder_.SetInsertPoint(loopBlock);
+
+                auto* resultPhi = builder_.CreatePHI(
+                    builder_.getInt64Ty(),
+                    2,
+                    "integer.power.result"
+                );
+
+                auto* basePhi = builder_.CreatePHI(
+                    builder_.getInt64Ty(),
+                    2,
+                    "integer.power.base"
+                );
+
+                auto* exponentPhi = builder_.CreatePHI(
+                    builder_.getInt64Ty(),
+                    2,
+                    "integer.power.exponent"
+                );
+
+                resultPhi->addIncoming(one, preheader);
+                basePhi->addIncoming(left, preheader);
+                exponentPhi->addIncoming(right, preheader);
+
+                auto* finished = builder_.CreateICmpEQ(
+                    exponentPhi,
+                    zero,
+                    "integer.power.finished"
+                );
+
+                builder_.CreateCondBr(
+                    finished,
+                    exitBlock,
+                    bodyBlock
+                );
+
+                // Multiply the result when the current exponent bit is set.
+                builder_.SetInsertPoint(bodyBlock);
+
+                auto* resultProductPair = builder_.CreateCall(
+                    multiplyWithOverflow,
+                    {resultPhi, basePhi},
+                    "integer.power.product.checked"
+                );
+
+                auto* resultProduct = builder_.CreateExtractValue(
+                    resultProductPair,
+                    {0},
+                    "integer.power.product"
+                );
+
+                auto* resultOverflow = builder_.CreateExtractValue(
+                    resultProductPair,
+                    {1},
+                    "integer.power.overflow"
+                );
+
+                auto* exponentIsOdd = builder_.CreateICmpNE(
+                    builder_.CreateAnd(exponentPhi, one),
+                    zero,
+                    "integer.power.odd"
+                );
+
+                auto* resultOverflowUsed = builder_.CreateAnd(
+                    exponentIsOdd,
+                    resultOverflow
+                );
+
+                emitAbortIf(
+                    resultOverflowUsed,
+                    expression->location,
+                    "Integer exponentiation overflow"
+                );
+
+                auto* nextResult = builder_.CreateSelect(
+                    exponentIsOdd,
+                    resultProduct,
+                    resultPhi,
+                    "integer.power.next.result"
+                );
+
+                // Shift the exponent to process its next bit.
+                auto* nextExponent = builder_.CreateLShr(
+                    exponentPhi,
+                    one,
+                    "integer.power.shift"
+                );
+
+                // Square the base for the next iteration.
+                auto* baseProductPair = builder_.CreateCall(
+                    multiplyWithOverflow,
+                    {basePhi, basePhi},
+                    "integer.power.square.checked"
+                );
+
+                auto* baseProduct = builder_.CreateExtractValue(
+                    baseProductPair,
+                    {0},
+                    "integer.power.square"
+                );
+
+                auto* baseOverflow = builder_.CreateExtractValue(
+                    baseProductPair,
+                    {1},
+                    "integer.power.square.overflow"
+                );
+
+                auto* needsSquare = builder_.CreateICmpNE(
+                    nextExponent,
+                    zero,
+                    "integer.power.needs.square"
+                );
+
+                auto* baseOverflowUsed = builder_.CreateAnd(
+                    needsSquare,
+                    baseOverflow
+                );
+
+                emitAbortIf(
+                    baseOverflowUsed,
+                    expression->location,
+                    "Integer exponentiation overflow"
+                );
+
+                // The current insertion block may now be an overflow-check
+                // continuation block.
+                auto* bodyEnd = builder_.GetInsertBlock();
+
+                builder_.CreateBr(loopBlock);
+
+                resultPhi->addIncoming(nextResult, bodyEnd);
+                basePhi->addIncoming(baseProduct, bodyEnd);
+                exponentPhi->addIncoming(nextExponent, bodyEnd);
+
+                // Return the accumulated result.
+                builder_.SetInsertPoint(exitBlock);
+
+                return resultPhi;
             }
         }
 

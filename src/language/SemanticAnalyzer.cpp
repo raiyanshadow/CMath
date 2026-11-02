@@ -434,23 +434,66 @@ std::vector<IRStatement> SemanticAnalyzer::analyzeStatements(
             }
             case Statement::Kind::Assignment: {
                 auto found = scope.find(statement.name);
+
                 if (found == scope.end()) {
-                    error(statement.location, "NameError", "Cannot assign to undeclared variable '" + statement.name + "'");
+                    error(
+                        statement.location,
+                        "RuntimeError",
+                        "Cannot assign to undeclared variable '" +
+                            statement.name + "'"
+                    );
                     break;
                 }
-                if (!found->second.mutableBinding)
-                    error(statement.location, "MutabilityError", "Cannot reassign immutable binding '" + statement.name + "'; declare it with 'var'");
+
+                if (!found->second.mutableBinding) {
+                    error(
+                        statement.location,
+                        "RuntimeError",
+                        "Cannot modify immutable variable '" +
+                            statement.name + "'"
+                    );
+                }
 
                 ExprPtr valueExpression = statement.expression;
 
-                auto value = analyzeExpression(statement.expression, scope);
-                if (!canWiden(value->type, found->second.type))
-                    error(statement.expression->location, "RuntimeError", "Cannot assign " + typeName(value->type) +
-                          " to variable '" + statement.name + "' of type " + typeName(found->second.type));
+                if (statement.assignmentOperator != "=") {
+                    const std::string op =
+                        statement.assignmentOperator.substr(0, 1);
+
+                    auto left = std::make_shared<Expr>();
+                    left->kind = Expr::Kind::Identifier;
+                    left->text = statement.name;
+                    left->location = statement.location;
+
+                    auto binary = std::make_shared<Expr>();
+                    binary->kind = Expr::Kind::Binary;
+                    binary->text = op;
+                    binary->location = statement.location;
+                    binary->children = {
+                        left,
+                        statement.expression
+                    };
+
+                    valueExpression = std::move(binary);
+                }
+
+                auto value = analyzeExpression(valueExpression, scope);
+
+                if (!canWiden(value->type, found->second.type)) {
+                    error(
+                        statement.location,
+                        "TypeError",
+                        "Cannot assign " + typeName(value->type) +
+                            " to variable '" + statement.name +
+                            "' of type " + typeName(found->second.type)
+                    );
+                }
+
                 ir.kind = IRStatement::Kind::Assign;
                 ir.name = statement.name;
                 ir.type = found->second.type;
                 ir.expression = value;
+
                 result.push_back(std::move(ir));
                 break;
             }

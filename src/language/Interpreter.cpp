@@ -282,6 +282,128 @@ namespace cmath::language::detail {
 
                 case IRExpression::Kind::ComplexImaginary:
                     return {ValueType::Complex, std::complex<double>(0, 1)};
+
+                case IRExpression::Kind::Increment: {
+                    if (expression->children.empty() ||
+                        expression->children.front()->kind != IRExpression::Kind::Variable) {
+                        throw RuntimeFault(
+                            expression->location,
+                            "RuntimeError",
+                            "Invalid increment/decrement target."
+                        );
+                    }
+
+                    const std::string& name = expression->children.front()->text;
+
+                    Environment* target = &environment;
+
+                    while (target && !target->values.contains(name)) {
+                        target = target->parent;
+                    }
+
+                    if (!target) {
+                        throw RuntimeFault(
+                            expression->location,
+                            "RuntimeError",
+                            "Increment/decrement target was not found."
+                        );
+                    }
+
+                    const auto mutableBinding = target->mutableBindings.find(name);
+
+                    if (mutableBinding == target->mutableBindings.end() ||
+                        !mutableBinding->second) {
+                        throw RuntimeFault(
+                            expression->location,
+                            "MutabilityError",
+                            "Cannot modify immutable variable '" + name + "'."
+                        );
+                    }
+
+                    const RuntimeValue previous = target->values.at(name);
+                    RuntimeValue updated = previous;
+
+                    const bool increment = expression->text == "++";
+
+                    switch (previous.type) {
+                        case ValueType::Integer: {
+                            const auto value = std::get<std::int64_t>(previous.data);
+                            std::int64_t result = 0;
+
+                            const bool succeeded = increment
+                                ? checkedAdd(value, 1, result)
+                                : checkedSub(value, 1, result);
+
+                            if (!succeeded) {
+                                throw RuntimeFault(
+                                    expression->location,
+                                    "OverflowError",
+                                    "Integer increment/decrement overflow."
+                                );
+                            }
+
+                            updated.data = result;
+                            break;
+                        }
+
+                        case ValueType::Rational: {
+                            const auto value = std::get<RationalValue>(previous.data);
+
+                            updated.data = increment
+                                ? rationalAdd(value, RationalValue{1, 1}, expression->location)
+                                : rationalSub(value, RationalValue{1, 1}, expression->location);
+
+                            break;
+                        }
+
+                        case ValueType::Real: {
+                            const double value = std::get<double>(previous.data);
+                            const double result = increment ? value + 1.0 : value - 1.0;
+
+                            if (!std::isfinite(result)) {
+                                throw RuntimeFault(
+                                    expression->location,
+                                    "OverflowError",
+                                    "Real increment/decrement produced a non-finite value."
+                                );
+                            }
+
+                            updated.data = result;
+                            break;
+                        }
+
+                        case ValueType::Complex: {
+                            const auto value = std::get<std::complex<double>>(previous.data);
+
+                            const auto result = increment
+                                ? value + std::complex<double>{1.0, 0.0}
+                                : value - std::complex<double>{1.0, 0.0};
+
+                            if (!std::isfinite(result.real()) ||
+                                !std::isfinite(result.imag())) {
+                                throw RuntimeFault(
+                                    expression->location,
+                                    "OverflowError",
+                                    "Complex increment/decrement overflow."
+                                );
+                            }
+
+                            updated.data = result;
+                            break;
+                        }
+
+                        default:
+                            throw RuntimeFault(
+                                expression->location,
+                                "TypeError",
+                                "Increment/decrement requires a numeric variable."
+                            );
+                    }
+
+                    target->values[name] = updated;
+
+                    return expression->postfix ? previous : updated;
+                }
                 
                 case IRExpression::Kind::Unary: {
                     auto value = evaluate(expression->children[0], environment);
