@@ -146,6 +146,7 @@ namespace cmath::language::detail {
             const Token& advance();
             bool consume(TokenKind kind, const std::string& message);
             void error(const Token& token, std::string code, std::string message);
+            void error(const SourceLocation& location, std::string code, std::string message);
             void synchronize();
             Statement parseStatement();
             Statement parseVariable();

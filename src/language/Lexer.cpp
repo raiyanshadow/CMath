@@ -208,22 +208,6 @@ namespace cmath::language::detail {
                 advance();
                 if (peek() == '+' || peek() == '-') advance();
                 while(std::isdigit(static_cast<unsigned char>(peek()))) advance();
-                if (peek() == '.' && std::isdigit(static_cast<unsigned char>(peek(1)))) {
-                    advance();
-                    while (std::isdigit(static_cast<unsigned char>(peek()))) {advance();}
-                }
-                if (peek() == 'e' || peek() == 'E') {
-                    std::size_t lookahead = current_ + 1;
-                    if (lookahead < source_.size() && (source_[lookahead] == '+' || source_[lookahead] == '-')) {
-                        ++lookahead;
-                    }
-
-                    if (lookahead < source_.size() && std::isdigit(static_cast<unsigned char>(source_[lookahead]))) {
-                        advance();
-                        if (peek() == '+' || peek() == '-') advance();
-                        while (std::isdigit(static_cast<unsigned char>(peek()))) {advance();}
-                    }
-                }
             }
         }
 

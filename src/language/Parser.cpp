@@ -32,6 +32,18 @@ namespace cmath::language::detail {
         diagnostics_.push_back(Diagnostic{DiagnosticSeverity::Error, std::move(code), std::move(message), token.location, {}});
     }
 
+    void Parser::error(const SourceLocation& location, std::string code,std::string message) {
+        if (diagnostics_.size() >= maximumDiagnostics_) return;
+
+        diagnostics_.push_back(Diagnostic{
+            DiagnosticSeverity::Error,
+            std::move(code),
+            std::move(message),
+            location,
+            {}
+        });
+    }
+
     void Parser::synchronize() {
         while (!check(TokenKind::EndOfFile)) {
             if (check(TokenKind::Newline)) {advance(); return;}
@@ -93,7 +105,7 @@ namespace cmath::language::detail {
         if (check(TokenKind::Return)) return parseReturn();
         if (check(TokenKind::If)) return parseIf();
         if (check(TokenKind::While)) return parseWhile();
-        if (check(TokenKind::For)) return parseIf();
+        if (check(TokenKind::For)) return parseFor();
         if (check(TokenKind::Break) || check(TokenKind::Continue)) return parseLoopControl();
         return parseAssignmentOrExpression();
     }
@@ -122,12 +134,13 @@ namespace cmath::language::detail {
 
     Statement Parser::parseFunction() {
         const Token keyword = advance();
-        const Token name = peek();
-        consume(TokenKind::Identifier, "Expected a function name after 'def'");
+        
         Statement statement;
         statement.kind = Statement::Kind::Function;
         statement.location = keyword.location;
+        
         const Token name = peek();
+        
         if (!consume(TokenKind::Identifier, "Expected a function name after 'def'")) {
             synchronize();
             return statement;
@@ -143,10 +156,19 @@ namespace cmath::language::detail {
         if (!check(TokenKind::RightParen)) {
             do {
                 const Token parameterName = peek();
-                if (!consume(TokenKind::Identifier, "Expected parameter name")) break;
-                consume(TokenKind::Colon, "Function parameters must have type annotation");
+                if (!consume(TokenKind::Identifier, "Expected parameter name")) {
+                    synchronize();
+                    return statement;
+                }
+                if (!consume(TokenKind::Colon, "Function parameters require type annotations")) {
+                    synchronize();
+                    return statement;
+                }
                 const Token type = peek();
-                if (!consume(TokenKind::Identifier, "Expected parameter type")) break;
+                if (!consume(TokenKind::Identifier, "Expected parameter type")) {
+                    synchronize();
+                    return statement;
+                }
                 statement.parameters.push_back(ParameterAst{parameterName.lexeme, type.lexeme, parameterName.location});
             } while (match(TokenKind::Comma));
         }
@@ -158,7 +180,11 @@ namespace cmath::language::detail {
         
         if (match(TokenKind::Arrow)) {
             const Token resultType = peek();
-            if (consume(TokenKind::Identifier, "Expected return type after '->'")) statement.returnType = resultType.lexeme;
+            if (!consume(TokenKind::Identifier, "Expected return type after '->'")) {
+                synchronize();
+                return statement;
+            }
+            statement.returnType = resultType.lexeme;
         } else {
             error(peek(), "ParseError", "Function return types are required");
         }
@@ -189,7 +215,7 @@ namespace cmath::language::detail {
             block->statements.push_back(parseStatement());
             if (current_ == before) advance();
         }
-        if (!consume(TokenKind::Dedent), "Expected the end of the indented block") {
+        if (!consume(TokenKind::Dedent, "Expected the end of the indented block")) {
             return block;
         }
         return block;
@@ -246,6 +272,8 @@ namespace cmath::language::detail {
                 statement.branches.push_back(parseBranch(branchKeyword));
                 continue;
             }
+
+            break;
         }
 
         if (match(TokenKind::Else)) {
@@ -313,8 +341,8 @@ namespace cmath::language::detail {
         return statement;
     }
 
-    statement Parser::parseLoopControl() {
-        const Token keywod = advance();
+    Statement Parser::parseLoopControl() {
+        const Token keyword = advance();
 
         Statement statement;
         statement.location = keyword.location;
@@ -437,12 +465,12 @@ namespace cmath::language::detail {
     }
 
     ExprPtr Parser::parseComparison() {
-        auto expression = parseAdditive();
+        auto expression = parseRange();
         while (check(TokenKind::EqualEqual) || check(TokenKind::NotEqual) ||
                check(TokenKind::Less) || check(TokenKind::Greater) ||
                check(TokenKind::LessEqual) || check(TokenKind::GreaterEqual)) {
             const Token op = advance();
-            auto right = parseAdditive();
+            auto right = parseRange();
             expression = makeExpr(Expr::Kind::Binary, op.lexeme, op.location, {expression, right});
         }
         return expression;
