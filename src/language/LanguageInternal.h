@@ -22,7 +22,7 @@ namespace cmath::language::detail {
         Equal, EqualEqual, NotEqual, Less, Greater, LessEqual, GreaterEqual,
         LeftParen, RightParen, Comma, Colon, Dot, Arrow,
         Newline, Indent, Dedent, EndOfFile, Invalid,
-        Range, If, Elif, Else, While, For, Break, Continue, And, Or, Not, DotDot
+        If, Elif, Else, While, For, Break, Continue, And, Or, Not, DotDot, In
     };
 
     struct Token {
@@ -69,7 +69,7 @@ namespace cmath::language::detail {
     };
 
     struct Expr {
-        enum class Kind {Number, String, Boolean, Identifier, Unary, Binary, Call, Member, PrefixIncrement, PostfixIncrement, PrefixDecrement, PostfixDecrement};
+        enum class Kind {Number, String, Boolean, Identifier, Unary, Binary, Call, Member, PrefixIncrement, PostfixIncrement, PrefixDecrement, PostfixDecrement, Range};
         Kind kind = Kind::Number;
         std::string text;
         SourceLocation location{};
@@ -151,10 +151,20 @@ namespace cmath::language::detail {
             Statement parseVariable();
             Statement parseFunction();
             Statement parseReturn();
+            Statement parseIf();
+            Statement parseWhile();
+            Statement parseFor();
+            Statement parseLoopControl();
             Statement parseAssignmentOrExpression();
-            std::vector<Statement> parseIndentedBlock();
+            
+            std::shared_ptr<AstBlock> parseIndentedBlock();
+            
             ExprPtr parseExpression();
+            ExprPtr parseOr();
+            ExprPtr parseAnd();
+            ExprPtr parseNot();
             ExprPtr parseComparison();
+            ExprPtr parseRange();
             ExprPtr parseAdditive();
             ExprPtr parseMultiplicative();
             ExprPtr parseUnary();

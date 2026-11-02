@@ -36,8 +36,21 @@ namespace cmath::language::detail {
         while (!check(TokenKind::EndOfFile)) {
             if (check(TokenKind::Newline)) {advance(); return;}
             if (check(TokenKind::Dedent)) return;
-            if (check(TokenKind::Let) || check(TokenKind::Var) || check(TokenKind::Def) || check(TokenKind::Return)) return;
-            advance();
+            switch (peek().kind) {
+                case TokenKind::Let:
+                case TokenKind::Var:
+                case TokenKind::Def:
+                case TokenKind::Return:
+                case TokenKind::If:
+                case TokenKind::While:
+                case TokenKind::For:
+                case TokenKind::Break:
+                case TokenKind::Continue:
+                    return;
+                default:
+                    advance();
+                    break;
+            }
         }
     }
 
@@ -53,6 +66,8 @@ namespace cmath::language::detail {
         }
         program.defaultDomain = domainToken.lexeme;
         program.domainLocation = domainToken.location;
+        program.body.location = domainToken.location;
+
         if (check(TokenKind::Newline)) advance();
         else if (!check(TokenKind::EndOfFile)) error(peek(), "ParseError", "Expected newline after domain declaration");
 
@@ -64,11 +79,7 @@ namespace cmath::language::detail {
                 continue;
             }
             const auto before = current_;
-            try {
-                program.statements.push_back(parseStatement());
-            } catch (...) {
-                synchronize();
-            } 
+            program.body.statements.push_back(parseStatement());
             if (current_ == before) advance();
         }
 
@@ -80,6 +91,10 @@ namespace cmath::language::detail {
         if (check(TokenKind::Let) || check(TokenKind::Var)) return parseVariable();
         if (check(TokenKind::Def)) return parseFunction();
         if (check(TokenKind::Return)) return parseReturn();
+        if (check(TokenKind::If)) return parseIf();
+        if (check(TokenKind::While)) return parseWhile();
+        if (check(TokenKind::For)) return parseIf();
+        if (check(TokenKind::Break) || check(TokenKind::Continue)) return parseLoopControl();
         return parseAssignmentOrExpression();
     }
 
@@ -112,8 +127,19 @@ namespace cmath::language::detail {
         Statement statement;
         statement.kind = Statement::Kind::Function;
         statement.location = keyword.location;
+        const Token name = peek();
+        if (!consume(TokenKind::Identifier, "Expected a function name after 'def'")) {
+            synchronize();
+            return statement;
+        }
+
         statement.name = name.lexeme;
-        consume(TokenKind::LeftParen, "Expected '(' after function name");
+
+        if (!consume(TokenKind::LeftParen, "Expected '(' after function name")) {
+            synchronize();
+            return statement;
+        }
+
         if (!check(TokenKind::RightParen)) {
             do {
                 const Token parameterName = peek();
@@ -124,30 +150,49 @@ namespace cmath::language::detail {
                 statement.parameters.push_back(ParameterAst{parameterName.lexeme, type.lexeme, parameterName.location});
             } while (match(TokenKind::Comma));
         }
-        consume(TokenKind::RightParen, "Expected ')' after function parameters.");
+
+        if(!consume(TokenKind::RightParen, "Expected ')' after function parameters")) {
+            synchronize();
+            return statement;
+        }
+        
         if (match(TokenKind::Arrow)) {
             const Token resultType = peek();
             if (consume(TokenKind::Identifier, "Expected return type after '->'")) statement.returnType = resultType.lexeme;
         } else {
             error(peek(), "ParseError", "Function return types are required");
         }
-        consume(TokenKind::Colon, "Expected ':' after function signature");
+        if (!consume(TokenKind::Colon, "Expected ':' after function signature")) {
+            synchronize();
+            return statement;
+        }
+
         statement.body = parseIndentedBlock();
         return statement;
     }
 
-    std::vector<Statement> Parser::parseIndentedBlock() {
-        std::vector<Statement> body;
-        consume(TokenKind::Newline, "Expected a newline before the function body");
-        if (!consume(TokenKind::Indent, "Expected an indented function body")) return body;
+    std::shared_ptr<AstBlock> Parser::parseIndentedBlock() {
+        auto block = std::make_shared<AstBlock>();
+        block->location = peek().location;
+        if (!consume(TokenKind::Newline, "Expected a newline before the block body")) {
+            if (!check(TokenKind::Indent)) return block;
+        }
+        if (!consume(TokenKind::Indent, "Expected an indented function body")) return block;
         while (!check(TokenKind::Dedent) && !check(TokenKind::EndOfFile)) {
             if (match(TokenKind::Newline)) continue;
+            if (check(TokenKind::Indent)) {
+                error(peek(), "ParseError", "Unexpected indentation inside block");
+                advance();
+                continue;
+            }
             const auto before = current_;
-            body.push_back(parseStatement());
+            block->statements.push_back(parseStatement());
             if (current_ == before) advance();
         }
-        consume(TokenKind::Dedent, "Expected the end of the funtion body");
-        return body;
+        if (!consume(TokenKind::Dedent), "Expected the end of the indented block") {
+            return block;
+        }
+        return block;
     }
 
     Statement Parser::parseReturn() {
@@ -157,6 +202,138 @@ namespace cmath::language::detail {
         statement.location = keyword.location;
         if (!check(TokenKind::Newline) && !check(TokenKind::Dedent) && !check(TokenKind::EndOfFile)) 
             statement.expression = parseExpression();
+        if (!check(TokenKind::Newline) && !check(TokenKind::Dedent) && !check(TokenKind::EndOfFile)) {
+            error(peek(), "ParseError", "Unexpected token after return expression");
+            synchronize();
+        }
+        match(TokenKind::Newline);
+        return statement;
+    }
+
+    Statement Parser::parseIf() {
+        const Token keyword = advance();
+        Statement statement;
+        statement.kind = Statement::Kind::If;
+        statement.location = keyword.location;
+
+        auto parseBranch = 
+            [this](const Token& branchKeyword) -> AstBranch {
+                AstBranch branch;
+
+                branch.location = branchKeyword.location;
+                branch.condition = parseExpression();
+
+                if (!consume(TokenKind::Colon, "Expected ':' after conditional expression")) {
+                    return branch;
+                }
+
+                branch.body = parseIndentedBlock();
+                return branch;
+            };
+        
+        statement.branches.push_back(parseBranch(keyword));
+
+        while (true) {
+            if (match(TokenKind::Elif)) {
+                const Token branchKeyword = tokens_[current_ - 1];
+                statement.branches.push_back(parseBranch(branchKeyword));
+                continue;
+            }
+
+            if (check(TokenKind::Else) && peek(1).kind == TokenKind::If) {
+                advance();
+                const Token branchKeyword = advance();
+                statement.branches.push_back(parseBranch(branchKeyword));
+                continue;
+            }
+        }
+
+        if (match(TokenKind::Else)) {
+            const Token elseKeyword = tokens_[current_ - 1];
+
+            if (!consume(TokenKind::Colon, "Expected ':' after 'else'")) {
+                return statement;
+            }
+
+            statement.elseBody = parseIndentedBlock();
+            statement.elseBody->location = elseKeyword.location;
+        }
+
+        return statement;
+    }
+
+    Statement Parser::parseWhile() {
+        const Token keyword = advance();
+
+        Statement statement;
+        statement.kind = Statement::Kind::While;
+        statement.location = keyword.location;
+
+        statement.expression = parseExpression();
+
+        if (!consume(TokenKind::Colon, "Expected ':' after while condition")) {
+            return statement;
+        }
+
+        statement.body = parseIndentedBlock();
+        return statement;
+    }
+
+    Statement Parser::parseFor() {
+        const Token keyword = advance();
+
+        Statement statement;
+        statement.kind = Statement::Kind::For;
+        statement.location = keyword.location;
+
+        const Token iterator = peek();
+
+        if (!consume(TokenKind::Identifier, "Expected an iterator name after 'for'")) {
+            synchronize();
+            return statement;
+        }
+
+        statement.name = iterator.lexeme;
+
+        if (!consume(TokenKind::In, "Expected 'in' after for-loop iterator")) {
+            synchronize();
+            return statement;
+        }
+
+        statement.expression = parseExpression();
+
+        if (statement.expression && statement.expression->kind != Expr::Kind::Range) {
+            error(statement.expression->location, "ParseError", "A for loop requires a range expression of the form start..end");
+        }
+
+        if (!consume(TokenKind::Colon, "Expected ':' after for-loop range")) {
+            return statement;
+        }
+        statement.body = parseIndentedBlock();
+        return statement;
+    }
+
+    statement Parser::parseLoopControl() {
+        const Token keywod = advance();
+
+        Statement statement;
+        statement.location = keyword.location;
+
+        if (keyword.kind == TokenKind::Break) {
+            statement.kind = Statement::Kind::Break;
+        } else {
+            statement.kind = Statement::Kind::Continue;
+        }
+
+        if (
+            !check(TokenKind::Newline) && 
+            !check(TokenKind::Dedent) &&
+            !check(TokenKind::EndOfFile)
+        ) {
+            error(peek(), "ParseError", "Unexpected expression after loop-control statement");
+            synchronize();
+        }
+
         match(TokenKind::Newline);
         return statement;
     }
@@ -193,6 +370,7 @@ namespace cmath::language::detail {
                     "ParseError",
                     "Unexpected token after assignment expression"
                 );
+                synchronize();
             }
 
             match(TokenKind::Newline);
@@ -212,6 +390,7 @@ namespace cmath::language::detail {
                 "ParseError",
                 "Unexpected token after expression"
             );
+            synchronize();
         }
 
         match(TokenKind::Newline);
@@ -227,7 +406,36 @@ namespace cmath::language::detail {
         return expression;
     }
 
-    ExprPtr Parser::parseExpression() {return parseComparison();}
+    ExprPtr Parser::parseExpression() {return parseOr();}
+
+    ExprPtr Parser::parseOr() {
+        auto expression = parseAnd();
+        while (match(TokenKind::Or)) {
+            const Token op = tokens_[current_ - 1];
+            auto right = parseAnd();
+            expression = makeExpr(Expr::Kind::Binary, op.lexeme, op.location, {expression, right});
+        }
+        return expression;
+    }
+
+    ExprPtr Parser::parseAnd() {
+        auto expression = parseNot();
+        while (match(TokenKind::And)) {
+            const Token op = tokens_[current_ - 1];
+            auto right = parseNot();
+            expression = makeExpr(Expr::Kind::Binary, op.lexeme, op.location, {expression, right});
+        }
+        return expression;
+    }
+
+    ExprPtr Parser::parseNot() {
+        if (match(TokenKind::Not)) {
+            const Token op = tokens_[current_ - 1];
+            return makeExpr(Expr::Kind::Unary, op.lexeme, op.location, {parseNot()});
+        }
+        return parseComparison();
+    }
+
     ExprPtr Parser::parseComparison() {
         auto expression = parseAdditive();
         while (check(TokenKind::EqualEqual) || check(TokenKind::NotEqual) ||
@@ -236,6 +444,19 @@ namespace cmath::language::detail {
             const Token op = advance();
             auto right = parseAdditive();
             expression = makeExpr(Expr::Kind::Binary, op.lexeme, op.location, {expression, right});
+        }
+        return expression;
+    }
+
+    ExprPtr Parser::parseRange() {
+        auto expression = parseAdditive();
+        if (match(TokenKind::DotDot)) {
+            const Token op = tokens_[current_ - 1];
+            auto right = parseAdditive();
+            expression = makeExpr(Expr::Kind::Range, op.lexeme, op.location, {expression, right});
+            if (check(TokenKind::DotDot)) {
+                error(peek(), "ParseError", "Chained range expressions are not supported");
+            }
         }
         return expression;
     }

@@ -171,7 +171,22 @@ namespace cmath::language::detail {
             {"let", TokenKind::Let}, {"var", TokenKind::Var},
             {"def", TokenKind::Def}, {"return", TokenKind::Return},
             {"domain", TokenKind::Domain}, {"true", TokenKind::True},
-            {"false", TokenKind::False}
+            {"false", TokenKind::False}, 
+            
+            {"if", TokenKind::If},
+            {"elif", TokenKind::Elif}, 
+            {"else", TokenKind::Else},
+
+            {"while", TokenKind::While},
+            {"for", TokenKind::For},
+            {"in", TokenKind::In},
+
+            {"break", TokenKind::Break},
+            {"continue", TokenKind::Continue},
+
+            {"and", TokenKind::And},
+            {"or", TokenKind::Or},
+            {"not", TokenKind::Not}
         };
         const auto found = keywords.find(text);
         add(found == keywords.end() ? TokenKind::Identifier : found->second, start, location);
@@ -193,8 +208,25 @@ namespace cmath::language::detail {
                 advance();
                 if (peek() == '+' || peek() == '-') advance();
                 while(std::isdigit(static_cast<unsigned char>(peek()))) advance();
+                if (peek() == '.' && std::isdigit(static_cast<unsigned char>(peek(1)))) {
+                    advance();
+                    while (std::isdigit(static_cast<unsigned char>(peek()))) {advance();}
+                }
+                if (peek() == 'e' || peek() == 'E') {
+                    std::size_t lookahead = current_ + 1;
+                    if (lookahead < source_.size() && (source_[lookahead] == '+' || source_[lookahead] == '-')) {
+                        ++lookahead;
+                    }
+
+                    if (lookahead < source_.size() && std::isdigit(static_cast<unsigned char>(source_[lookahead]))) {
+                        advance();
+                        if (peek() == '+' || peek() == '-') advance();
+                        while (std::isdigit(static_cast<unsigned char>(peek()))) {advance();}
+                    }
+                }
             }
         }
+
         add(TokenKind::Number, start, location);
     }
 
@@ -271,7 +303,14 @@ namespace cmath::language::detail {
             case ')': if (bracketDepth_ > 0) --bracketDepth_; one(TokenKind::RightParen); break;
             case ',': one(TokenKind::Comma); break;
             case ':': one(TokenKind::Colon); break;
-            case '.': one(TokenKind::Dot); break;
+            case '.': {
+                if (match('.'))
+                    one(TokenKind::DotDot);
+                else
+                    one(TokenKind::Dot);
+
+                break;
+            }
             case '\'': case '"': scanString(); break;
             default:
                 if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') scanIdentifier();
@@ -318,5 +357,4 @@ namespace cmath::language::detail {
         tokens_.push_back(Token{TokenKind::EndOfFile, "", SourceLocation{line_, column_, current_}});
         return LexResult{std::move(tokens_), std::move(diagnostics_)};
     }
-
 }
