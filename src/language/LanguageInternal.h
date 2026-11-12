@@ -319,9 +319,10 @@ namespace cmath::language::detail {
             std::optional<ValueType> resolveType(const std::string& name, const SourceLocation& loc);
             void collectFunctions(const AstProgram& ast);
             void analyzeFunction(const Statement& statement);
-            std::vector<IRStatement> analyzeStatements(const AstBlock& block,
-                                                        Scope& parentScope, bool inFunction,
+            IRBlock analyzeBlock(const AstBlock& block,
+                                                        Scope& scope, bool inFunction,
                                                         ValueType returnType, std::size_t loopDepth);
+            const SymbolInfo* findSymbol(const Scope& scope, const std::string& name) const;
             IRExprPtr analyzeExpression(const ExprPtr& expression, const Scope& scope);
             IRExprPtr makeIR(IRExpression::Kind kind, std::string text, ValueType type,
                             const SourceLocation& location, std::vector<IRExprPtr> children = {});

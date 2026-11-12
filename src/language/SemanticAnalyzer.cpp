@@ -1,8 +1,9 @@
 #include "LanguageInternal.h"
 
-#include <algorithm>
 #include <cmath>
 #include <unordered_set>
+#include <utility>
+#include <iterator>
 
 namespace cmath::language::detail {
 
@@ -13,14 +14,19 @@ std::optional<long double> constantReal(const ExprPtr& expression) {
         switch (expression->kind) {
             case Expr::Kind::Number: return std::stold(expression->text);
             case Expr::Kind::Unary: {
+                if (expression->children.empty()) return std::nullopt;
                 auto value = constantReal(expression->children[0]);
                 if (!value) return std::nullopt;
                 if (expression->text == "-") return -*value;
-                return *value;
+                if (expression->text == "+") return *value;
+                return std::nullopt;
             }
             case Expr::Kind::Binary: {
+                if (expression->children.size() < 2) return std::nullopt;
+
                 auto left = constantReal(expression->children[0]);
                 auto right = constantReal(expression->children[1]);
+
                 if (!left || !right) return std::nullopt;
                 if (expression->text == "+") return *left + *right;
                 if (expression->text == "-") return *left - *right;
@@ -39,6 +45,17 @@ std::optional<long double> constantReal(const ExprPtr& expression) {
     }
 }
 } // namespace
+
+bool isReservedName(const std::string& name) {
+    static const std::unordered_set<std::string> reserved{
+        "print", "sqrt", "sin", "cos", "tan", "exp", "log", "abs",
+        "floor", "approximate", "to_integer_exact", "pi", "e",
+        "Complex", "Integer", "Rational", "Real", "Boolean", "Bool",
+        "String", "Unit"
+    };
+
+    return reserved.contains(name);
+}
 
 
 std::string typeName(ValueType type) {
@@ -98,15 +115,49 @@ std::optional<ValueType> SemanticAnalyzer::resolveType(const std::string& name,
     return type;
 }
 
-void SemanticAnalyzer::collectFunctions(const AstProgram& ast) {
-    static const std::unordered_set<std::string> reserved{
-        "print", "sqrt", "sin", "cos", "tan", "exp", "log", "abs",
-        "floor", "approximate", "to_integer_exact", "pi", "e", "Complex",
-        "Integer", "Rational", "Real", "Boolean", "Bool", "String", "Unit"
+const SemanticAnalyzer::SymbolInfo* SemanticAnalyzer::findSymbol(const Scope& scope, const std::string& name) const {
+    const Scope* current = &scope;
+    while (current != nullptr) {
+        const auto found = current->symbols.find(name);
+
+        if (found != current->symbols.end()) 
+            return &found->second;
+        current = current->parent;
+    }
+
+    return nullptr;
+}
+
+ValueType SemanticAnalyzer::promotedNumeric(ValueType left, ValueType right) const {
+    const auto rank = [](ValueType type) {
+        switch (type) {
+            case ValueType::Integer: return 0;
+            case ValueType::Rational: return 1;
+            case ValueType::Real: return 2;
+            case ValueType::Complex: return 3;
+            default: return -1;
+        }
     };
-    for (const auto& statement : ast.statements) {
+
+    return rank(left) >= rank(right) ? left : right;
+}
+
+IRExprPtr SemanticAnalyzer::makeIR(IRExpression::Kind kind, std::string text, ValueType type, const SourceLocation& location, std::vector<IRExprPtr> children) {
+    auto result = std::make_shared<IRExpression>();
+
+    result->kind = kind;
+    result->text = std::move(text);
+    result->type = type;
+    result->location = location;
+    result->children = std::move(children);
+
+    return result;
+}
+
+void SemanticAnalyzer::collectFunctions(const AstProgram& ast) {
+    for (const auto& statement : ast.body.statements) {
         if (statement.kind != Statement::Kind::Function) continue;
-        if (reserved.contains(statement.name)) {
+        if (isReservedName(statement.name)) {
             error(statement.location, "SemanticsError", "Function name '" + statement.name + "' is reserved");
             continue;
         }
@@ -118,12 +169,7 @@ void SemanticAnalyzer::collectFunctions(const AstProgram& ast) {
         bool valid = true;
         std::unordered_set<std::string> parameterNames;
         for (const auto& parameter : statement.parameters) {
-            static const std::unordered_set<std::string> reservedParameters{
-                "print", "sqrt", "sin", "cos", "tan", "exp", "log", "abs",
-                "floor", "approximate", "to_integer_exact", "pi", "e", "Complex",
-                "Integer", "Rational", "Real", "Boolean", "Bool", "String", "Unit"
-            };
-            if (reservedParameters.contains(parameter.name)) {
+            if (isReservedName(parameter.name)) {
                 error(parameter.location, "SemanticsError", "Parameter name '" + parameter.name + "' is reserved");
                 valid = false;
             }
@@ -140,31 +186,6 @@ void SemanticAnalyzer::collectFunctions(const AstProgram& ast) {
         else signature.result = *returnType;
         if (valid) signatures_.emplace(statement.name, std::move(signature));
     }
-}
-
-ValueType SemanticAnalyzer::promotedNumeric(ValueType left, ValueType right) const {
-    const auto rank = [](ValueType type) {
-        switch (type) {
-            case ValueType::Integer: return 0;
-            case ValueType::Rational: return 1;
-            case ValueType::Real: return 2;
-            case ValueType::Complex: return 3;
-            default: return -1;
-        }
-    };
-    return rank(left) >= rank(right) ? left : right;
-}
-
-IRExprPtr SemanticAnalyzer::makeIR(IRExpression::Kind kind, std::string text,
-                                   ValueType type, const SourceLocation& location,
-                                   std::vector<IRExprPtr> children) {
-    auto result = std::make_shared<IRExpression>();
-    result->kind = kind;
-    result->text = std::move(text);
-    result->type = type;
-    result->location = location;
-    result->children = std::move(children);
-    return result;
 }
 
 IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const Scope& scope) {
@@ -184,10 +205,10 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
             return makeIR(IRExpression::Kind::Literal, expression->text, ValueType::Boolean,
                           expression->location);
         case Expr::Kind::Identifier: {
-            const auto found = scope.find(expression->text);
-            if (found != scope.end())
+            const auto* symbol = findSymbol(scope, expression->text);
+            if (symbol)
                 return makeIR(IRExpression::Kind::Variable, expression->text,
-                              found->second.type, expression->location);
+                              symbol->type, expression->location);
             if (expression->text == "pi" || expression->text == "e")
                 return makeIR(IRExpression::Kind::Variable, expression->text,
                               ValueType::Real, expression->location);
@@ -206,11 +227,22 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
             return makeIR(IRExpression::Kind::Variable, expression->text,
                           ValueType::Error, expression->location);
         }
+        case Expr::Kind::Range: {
+            error(expression->location, "TypeError", "Range expressions may only be used as a for-loop range");
+            return makeIR(IRExpression::Kind::Literal, "0", ValueType::Error, expression->location);
+        }
         case Expr::Kind::Unary: {
             auto operand = analyzeExpression(expression->children[0], scope);
-            if (!isNumeric(operand->type)) {
+            if (expression->text == "not") {
+                if (operand->type != ValueType::Boolean &&
+                operand->type != ValueType::Error) {
+                    error(expression->location, "TypeError", "'not' requires a Boolean operand");
+                }
+                return makeIR(IRExpression::Kind::Unary, expression->text, ValueType::Boolean, expression->location, {operand});
+            }
+            if (!isNumeric(operand->type) && operand->type != ValueType::Error) {
                 error(expression->location, "TypeError", "Unary '" + expression->text +
-                      "' requires a numeric operand, not " + typeName(operand->type) + "");
+                      "' requires a numeric operand, not " + typeName(operand->type));
             }
             return makeIR(IRExpression::Kind::Unary, expression->text, operand->type,
                           expression->location, {operand});
@@ -222,30 +254,30 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
             const bool postfix = expression->kind == Expr::Kind::PostfixIncrement || expression->kind == Expr::Kind::PostfixDecrement;
 
             if (expression->children.empty() || expression->children.front()->kind != Expr::Kind::Identifier) {
-                error(expression->location, "TypeError", "Increment and decremen requires mutable variable");
+                error(expression->location, "TypeError", "Increment and decrement requires mutable variable");
                 auto invalid = makeIR(IRExpression::Kind::Increment, expression->text, ValueType::Error, expression->location);
                 invalid->postfix = postfix;
                 return invalid;
             }
 
             const auto& target = expression->children.front();
-            const auto found = scope.find(target->text);
+            const auto* symbol = findSymbol(scope, target->text);
 
-            if (found == scope.end()) {
-                error(expression->location, "NameError", "Cannot incrememnt or decrement unknown variable '" + target->text + "'");
+            if (!symbol) {
+                error(expression->location, "NameError", "Cannot increment or decrement unknown variable '" + target->text + "'");
                 return makeIR(IRExpression::Kind::Increment, expression->text, ValueType::Error, expression->location);
             }
 
-            if (!found->second.mutableBinding) {
+            if (!symbol->mutableBinding) {
                 error(expression->location, "MutabilityError", "Cannot increment or decrement immutable variable '" + target->text + "'");
             }
 
-            if (!isNumeric(found->second.type)) {
+            if (!isNumeric(symbol->type)) {
                 error(expression->location, "TypeError", "Increment and decrement require a numeric variable");
             }
 
-            auto variable = makeIR(IRExpression::Kind::Variable, target->text, found->second.type, target->location);
-            auto result = makeIR(IRExpression::Kind::Increment, expression->text, found->second.type, expression->location, {variable});
+            auto variable = makeIR(IRExpression::Kind::Variable, target->text, symbol->type, target->location);
+            auto result = makeIR(IRExpression::Kind::Increment, expression->text, symbol->type, expression->location, {variable});
 
             result->postfix = postfix;
             return result;
@@ -286,6 +318,11 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
                     if (op == "/" && result != ValueType::Real && result != ValueType::Complex)
                         result = ValueType::Rational;
                 }
+            } else if (op == "and" || op == "or") {
+                if ((left->type != ValueType::Boolean && left->type != ValueType::Error) || (right->type != ValueType::Boolean && right->type != ValueType::Error)) {
+                    error(expression->location, "TypeError", "Logical operator '" + op + "' requires Boolean operands");
+                }
+                result = ValueType::Boolean;
             } else {
                 const bool equality = op == "==" || op == "!=";
                 if (isNumeric(left->type) && isNumeric(right->type)) {
@@ -317,7 +354,7 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
                                                         IRExprPtr& result) {
     if (expression->children.empty() ||
         expression->children[0]->kind != Expr::Kind::Identifier) {
-        error(expression->location, "RuntimeError", "Only named functions can be called");
+        error(expression->location, "NameError", "Only named functions can be called");
         result = makeIR(IRExpression::Kind::Call, "", ValueType::Error, expression->location);
         return ValueType::Error;
     }
@@ -391,74 +428,89 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
     return returnType;
 }
 
-std::vector<IRStatement> SemanticAnalyzer::analyzeStatements(
-    const std::vector<Statement>& statements, Scope& scope, bool inFunction,
-    ValueType returnType, bool& sawReturn) {
-    std::vector<IRStatement> result;
-    for (const auto& statement : statements) {
-        IRStatement ir;
-        ir.location = statement.location;
+IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool inFunction, ValueType returnType, std::size_t loopDepth) {
+    IRBlock result;
+    result.location = block.location;
+
+    bool reachable = true;
+
+    auto append = [&](IRStatementData data, const SourceLocation& location) {
+        result.statements.push_back(IRStatement{location, std::move(data)});
+    };
+
+    auto mergeFlow = [&](const FlowSummary& flow) {
+        if (!reachable)
+            return;
+
+        result.flow.mayReturn = result.flow.mayReturn || flow.mayReturn;
+
+        result.flow.mayBreak = result.flow.mayBreak || flow.mayBreak;
+
+        result.flow.mayContinue = result.flow.mayContinue || flow.mayContinue;
+
+        if (!flow.canFallThrough)
+            reachable = false;
+    };
+
+    for (const auto& statement : block.statements) {
+        FlowSummary statementFlow;
+
         switch (statement.kind) {
             case Statement::Kind::Variable: {
-                static const std::unordered_set<std::string> reservedNames{
-                    "print", "sqrt", "sin", "cos", "tan", "exp", "log", "abs",
-                    "floor", "approximate", "to_integer_exact", "pi", "e", "Complex",
-                    "Integer", "Rational", "Real", "Boolean", "Bool", "String", "Unit"
-                };
-                if (reservedNames.contains(statement.name) || signatures_.contains(statement.name))
-                    error(statement.location, "SemanticsError", "Name '" + statement.name + "' is reserved by a built-in or function declaration");
-                if (scope.contains(statement.name) && !allowShadowing_) {
-                    error(statement.location, "RuntimeError", "Name '" + statement.name + "' is already declared in this scope");
+                if (isReservedName(statement.name) || signatures_.contains(statement.name)) {
+                    error(statement.location, "SemanticError", "Name '" + statement.name + "' is reserved by a built-in or function declaration");
                 }
+
+                if (scope.symbols.contains(statement.name)) {
+                    error(statement.location, "NameError", "Name '" + statement.name + "' is already declared in this scope");
+                } else if (!allowShadowing_ && scope.parent && findSymbol(*scope.parent, statement.name)) {
+                    error(statement.location, "NameError", "Declaration of '" + statement.name + "' shadows an existing name");
+                }
+
                 auto initializer = analyzeExpression(statement.expression, scope);
                 ValueType declared = initializer->type;
+
                 if (!statement.typeName.empty()) {
                     auto explicitType = resolveType(statement.typeName, statement.location);
                     if (explicitType) {
                         declared = *explicitType;
                         if (!canWiden(initializer->type, declared)) {
-                            error(statement.expression->location, "RuntimeError", "Cannot assign " +
-                                  typeName(initializer->type) + " to " + typeName(declared) + ".",
-                                  {"Use a wider declared type or an explicit checked conversion"});
+                            error(statement.expression ? statement.expression->location : statement.location, "TypeError", 
+                            "Cannot assign " + typeName(initializer->type) + " to " +  typeName(declared));
                         }
                     }
                 }
-                scope[statement.name] = SymbolInfo{declared, statement.mutableBinding};
-                ir.kind = IRStatement::Kind::Declare;
-                ir.name = statement.name;
-                ir.type = declared;
-                ir.mutableBinding = statement.mutableBinding;
-                ir.expression = initializer;
-                result.push_back(std::move(ir));
+
+                if (!scope.symbols.contains(statement.name)) {
+                    scope.symbols.emplace(statement.name, SymbolInfo{declared, statement.mutableBinding});
+                }
+
+                IRDeclaration declaration;
+                declaration.name = statement.name;
+                declaration.type = declared;
+                declaration.mutableBinding = statement.mutableBinding;
+                declaration.initializer = std::move(initializer);
+
+                append(std::move(declaration), statement.location);
                 break;
             }
-            case Statement::Kind::Assignment: {
-                auto found = scope.find(statement.name);
 
-                if (found == scope.end()) {
-                    error(
-                        statement.location,
-                        "RuntimeError",
-                        "Cannot assign to undeclared variable '" +
-                            statement.name + "'"
-                    );
+            case Statement::Kind::Assignment: {
+                const auto* symbol = findSymbol(scope, statement.name);
+
+                if (!symbol) {
+                    error(statement.location, "NameError", "Cannot assign to undeclared variable '" + statement.name + "'");
                     break;
                 }
 
-                if (!found->second.mutableBinding) {
-                    error(
-                        statement.location,
-                        "RuntimeError",
-                        "Cannot modify immutable variable '" +
-                            statement.name + "'"
-                    );
+                if (!symbol->mutableBinding) {
+                    error(statement.location, "MutabilityError", "Cannot modify immutable variable '" + statement.name + "'");
                 }
 
                 ExprPtr valueExpression = statement.expression;
 
                 if (statement.assignmentOperator != "=") {
-                    const std::string op =
-                        statement.assignmentOperator.substr(0, 1);
+                    const std::string op = statement.assignmentOperator.substr(0, 1);
 
                     auto left = std::make_shared<Expr>();
                     left->kind = Expr::Kind::Identifier;
@@ -473,74 +525,231 @@ std::vector<IRStatement> SemanticAnalyzer::analyzeStatements(
                         left,
                         statement.expression
                     };
-
                     valueExpression = std::move(binary);
                 }
 
                 auto value = analyzeExpression(valueExpression, scope);
 
-                if (!canWiden(value->type, found->second.type)) {
-                    error(
-                        statement.location,
-                        "TypeError",
-                        "Cannot assign " + typeName(value->type) +
-                            " to variable '" + statement.name +
-                            "' of type " + typeName(found->second.type)
-                    );
+                if (!canWiden(value->type, symbol->type)) {
+                    error(statement.location, "TypeError", "Cannot assign " + typeName(value->type) + " to variable '" + statement.name + "' of type " + typeName(symbol->type));
                 }
 
-                ir.kind = IRStatement::Kind::Assign;
-                ir.name = statement.name;
-                ir.type = found->second.type;
-                ir.expression = value;
+                IRAssignment assignment;
+                assignment.name = statement.name;
+                assignment.type = symbol->type;
+                assignment.expression = std::move(value);
 
-                result.push_back(std::move(ir));
+                append(std::move(assignment), statement.location);
                 break;
             }
+
             case Statement::Kind::Expression: {
-                ir.kind = IRStatement::Kind::Expression;
-                ir.expression = analyzeExpression(statement.expression, scope);
-                result.push_back(std::move(ir));
+                IRExpressionStatement expressionStatement;
+                expressionStatement.expression = analyzeExpression(statement.expression, scope);
+
+                append(std::move(expressionStatement), statement.location);
                 break;
             }
+
             case Statement::Kind::Return: {
                 if (!inFunction) {
-                    error(statement.location, "RuntimeError", "'return' can only appear inside a function");
+                    error(statement.location, "ControlFlowError", "'return' can only appear inside a function");
                     break;
                 }
-                sawReturn = true;
+
+                IRReturn returnStatement;
+                returnStatement.type = returnType;
+
                 if (returnType == ValueType::Unit) {
-                    if (statement.expression)
-                        error(statement.location, "RuntimeError", "A Unit function cannot return a value");
-                    ir.type = ValueType::Unit;
+                    if (statement.expression) {
+                        error(statement.location, "TypeError", "A Unit function cannot return a value");
+
+                        returnStatement.expression = analyzeExpression(statement.expression, scope);
+                    }
+                } else if (!statement.expression) {
+                    error(statement.location, "TypeError", "A function returning " + typeName(returnType) + " must return a value");
                 } else {
-                    if (!statement.expression) {
-                        error(statement.location, "RuntimeError", "A function returning " + typeName(returnType) + " must return a value");
-                        ir.type = returnType;
-                    } else {
-                        ir.expression = analyzeExpression(statement.expression, scope);
-                        if (!canWiden(ir.expression->type, returnType))
-                            error(statement.expression->location, "RuntimeError", "Function returns " +
-                                  typeName(ir.expression->type) + "; declared return type is " + typeName(returnType));
-                        ir.type = returnType;
+                    returnStatement.expression = analyzeExpression(statement.expression, scope);
+                    if (!canWiden(returnStatement.expression->type, returnType)) {
+                        error(statement.expression->location, "TypeError", "Function returns " + typeName(returnStatement.expression->type) + "; declared return type is " + typeName(returnType));
                     }
                 }
-                ir.kind = IRStatement::Kind::Return;
-                result.push_back(std::move(ir));
+
+                append(std::move(returnStatement), statement.location);
+                statementFlow.canFallThrough = false;
+                statementFlow.mayReturn = true;
                 break;
             }
+
+            case Statement::Kind::If: {
+                IRIf conditional;
+                bool allBranchesReturn = true;
+                bool hasBranch = false;
+
+                for (const auto& branch: statement.branches) {
+                    hasBranch = true;
+                    auto condition = analyzeExpression(branch.condition, scope);
+                    if (condition->type != ValueType::Boolean && condition->type != ValueType::Error) {
+                        error(branch.location, "TypeError", "An if/elif condition must have type Boolean");
+                    }
+                    
+                    Scope branchScope;
+                    branchScope.parent = &scope;
+
+                    IRBlock body;
+
+                    if (branch.body) {
+                        body = analyzeBlock(*branch.body, branchScope, inFunction, returnType, loopDepth);
+                    }
+
+                    allBranchesReturn = allBranchesReturn && !body.flow.canFallThrough;
+                    conditional.branches.push_back(IRIfBranch{std::move(condition), std::make_shared<IRBlock>(std::move(body))});
+
+                    statementFlow.mayReturn = statementFlow.mayReturn || conditional.branches.back().body->flow.mayReturn;
+                    statementFlow.mayBreak = statementFlow.mayBreak || conditional.branches.back().body->flow.mayBreak;
+                    statementFlow.mayContinue = statementFlow.mayContinue || conditional.branches.back().body->flow.mayContinue;
+                }
+
+                if (statement.elseBody) {
+                    Scope elseScope;
+                    elseScope.parent = &scope;
+
+                    auto elseBody = analyzeBlock(*statement.elseBody, elseScope, inFunction, returnType, loopDepth);
+                    allBranchesReturn = allBranchesReturn && !elseBody.flow.canFallThrough;
+                    statementFlow.mayReturn = statementFlow.mayReturn || elseBody.flow.mayReturn;
+                    statementFlow.mayBreak = statementFlow.mayBreak || elseBody.flow.mayBreak;
+                    statementFlow.mayContinue = statementFlow.mayContinue || elseBody.flow.mayContinue;
+                    conditional.elseBody = std::make_shared<IRBlock>(std::move(elseBody));
+                } else {
+                    allBranchesReturn = false;
+                }
+
+                statementFlow.canFallThrough = !hasBranch || !allBranchesReturn;
+                append(std::move(conditional), statement.location);
+                break;
+            }
+
+            case Statement::Kind::While: {
+                auto condition = analyzeExpression(
+                    statement.expression, scope
+                );
+
+                if (condition->type != ValueType::Boolean && condition->type != ValueType::Error) {
+                    error(statement.location, "TypeError", "A while condition must have type Boolean");
+                }
+
+                Scope bodyScope;
+                bodyScope.parent = &scope;
+
+                IRBlock body;
+                if (statement.body) {
+                    body = analyzeBlock(*statement.body, bodyScope, inFunction, returnType, loopDepth+1);
+                }
+
+                IRWhile loop;
+                loop.condition = std::move(condition);
+                loop.body = std::make_shared<IRBlock>(std::move(body));
+
+                statementFlow.canFallThrough = true;
+                statementFlow.mayReturn = loop.body->flow.mayReturn;
+
+                statementFlow.mayBreak = false;
+                statementFlow.mayContinue = false;
+
+                append(std::move(loop), statement.location);
+                break;
+            }
+
+            case Statement::Kind::For: {
+                if (!statement.expression || statement.expression->kind != Expr::Kind::Range || statement.expression->children.size() != 2) {
+                    error(statement.location, "TypeError", "A for loop requires an integer range of the form start..end");
+                    break;
+                }
+
+                auto start = analyzeExpression(statement.expression->children[0], scope);
+                auto end = analyzeExpression(statement.expression->children[1], scope);
+
+                if (start->type != ValueType::Integer && start->type != ValueType::Error) {
+                    error(statement.expression->children[0]->location, "TypeError", "The starting value of a for range must be Integer");
+                }
+                if (end->type != ValueType::Integer && end->type != ValueType::Error) {
+                    error(statement.expression->children[1]->location, "TypeError", "The ending value of a for range must be Integer");
+                }
+
+                Scope iteratorScope;
+                iteratorScope.parent = &scope;
+
+                if (isReservedName(statement.name) || signatures_.contains(statement.name)) {
+                    error(statement.location, "NameError", "For-loop iterator name '" + statement.name + "' is reserved");
+                }
+
+                if (!allowShadowing_ && findSymbol(scope, statement.name)) {
+                    error(statement.location, "NameError", "For-loop iterator '" + statement.name + "' shadows an existing name");
+                }
+
+                iteratorScope.symbols.emplace(statement.name, SymbolInfo{ValueType::Integer, false});
+
+                Scope bodyScope;
+                bodyScope.parent = &iteratorScope;
+
+                IRBlock body;
+                if (statement.body) {
+                    body = analyzeBlock(*statement.body, bodyScope, inFunction, returnType, loopDepth + 1);
+                }
+
+                IRFor loop;
+                loop.iterator = statement.name;
+                loop.start = std::move(start);
+                loop.end = std::move(end);
+                loop.body = std::make_shared<IRBlock>(std::move(body));
+
+                statementFlow.canFallThrough = true;
+                statementFlow.mayReturn = loop.body->flow.mayReturn;
+                statementFlow.mayBreak = false;
+                statementFlow.mayContinue = false;
+
+                append(std::move(loop), statement.location);
+                break;
+            }
+
+            case Statement::Kind::Break: {
+                if (loopDepth == 0) {
+                    error(statement.location, "ControlFlowError", "'break' can only appear inside a loop");
+                    break;
+                }
+                append(IRBreak{}, statement.location);
+                statementFlow.canFallThrough = false;
+                statementFlow.mayBreak = true;
+                break;
+            }
+
+            case Statement::Kind::Continue: {
+                if (loopDepth == 0) {
+                    error(statement.location, "ControlFlowError", "'continue' can only appear inside a loop");
+                    break;
+                }
+                append(IRContinue{}, statement.location);
+                statementFlow.canFallThrough = false;
+                statementFlow.mayContinue = true;
+                break;
+            }
+
             case Statement::Kind::Function:
-                error(statement.location, "RuntimeError", "Nested function definitions is not supported");
+                error(statement.location, "SemanticError", "Nested function definitions not supported");
                 break;
         }
+
+        mergeFlow(statementFlow);
     }
+    result.flow.canFallThrough = reachable;
     return result;
 }
 
 void SemanticAnalyzer::analyzeFunction(const Statement& statement) {
     const auto signatureIt = signatures_.find(statement.name);
     if (signatureIt == signatures_.end()) return;
-    Scope scope = globals_;
+    Scope functionScope;
+    functionScope.parent = &globals_;
     IRFunction function;
     function.name = statement.name;
     function.returnType = signatureIt->second.result;
@@ -549,18 +758,18 @@ void SemanticAnalyzer::analyzeFunction(const Statement& statement) {
     for (std::size_t i = 0; i < statement.parameters.size(); ++i) {
         const auto& parameter = statement.parameters[i];
         const auto type = signatureIt->second.parameters[i];
-        if (scope.contains(parameter.name) && !allowShadowing_)
+        if (findSymbol(globals_, parameter.name) && !allowShadowing_)
             error(parameter.location, "RuntimeError", "Parameter '" + parameter.name + "' shadows an existing global name");
-        scope[parameter.name] = SymbolInfo{type, false};
+        functionScope.symbols.emplace(parameter.name, SymbolInfo{type, false});
         function.parameters.push_back(IRParameter{parameter.name, type});
     }
 
-    bool sawReturn = false;
-    function.body = analyzeStatements(statement.body, scope, true, function.returnType, sawReturn);
-    if (!sawReturn)
-        error(statement.location, "RuntimeError", "Function '" + statement.name + "' must contain a return statement");
-    if (statement.body.empty() || statement.body.back().kind != Statement::Kind::Return)
-        error(statement.location, "RuntimeError", "A function's return statement must be its final statement");
+    AstBlock emptyBody;
+    const AstBlock& body = statement.body ? *statement.body : emptyBody;
+    function.body = analyzeBlock(body, functionScope, true, function.returnType, 0);
+    if (function.returnType != ValueType::Unit && function.body.flow.canFallThrough) {
+        error(statement.location, "ControlFlowError", "Function '" + statement.name + "' does not return a value on every possible execution path");
+    }
     functions_[statement.name] = std::move(function);
 }
 
@@ -568,13 +777,13 @@ SemanticResult SemanticAnalyzer::analyze(const AstProgram& ast) {
     diagnostics_.clear();
     signatures_.clear();
     functions_.clear();
-    globals_.clear();
+    globals_ = Scope{};
     defaultDomain_ = ast.defaultDomain;
 
     static const std::unordered_set<std::string> domains{"Integer", "Rational", "Real", "Complex"};
     if (!domains.contains(defaultDomain_))
         error(ast.domainLocation, "DomainError", "Unknown default domain '" + defaultDomain_ +
-              "'. Supported domains in Language 0.1: Integer, Rational, Real, Complex");
+              "'. Supported domains: Integer, Rational, Real, Complex");
 
     collectFunctions(ast);
     auto program = std::make_shared<ProgramIR>();
@@ -582,18 +791,18 @@ SemanticResult SemanticAnalyzer::analyze(const AstProgram& ast) {
 
     // Process top-level declarations in source order. Functions can call later
     // function declarations, but can only reference globals declared earlier.
-    for (const auto& statement : ast.statements) {
+    for (const auto& statement : ast.body.statements) {
         if (statement.kind == Statement::Kind::Function) {
             analyzeFunction(statement);
             continue;
         }
-        Scope globalScope = globals_;
-        bool sawReturn = false;
-        auto lowered = analyzeStatements({statement}, globalScope, false,
-                                         ValueType::Error, sawReturn);
-        if (statement.kind == Statement::Kind::Variable && globalScope.contains(statement.name))
-            globals_[statement.name] = globalScope[statement.name];
-        program->statements.insert(program->statements.end(), lowered.begin(), lowered.end());
+        AstBlock singleStatement;
+        singleStatement.location = statement.location;
+        singleStatement.statements.push_back(statement);
+
+        IRBlock lowered = analyzeBlock(singleStatement, globals_, false,
+                                         ValueType::Error, 0);
+        program->body.statements.insert(program->body.statements.end(), std::make_move_iterator(lowered.statements.begin()), std::make_move_iterator(lowered.statements.end()));
     }
     program->functions = functions_;
 
