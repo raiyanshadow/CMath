@@ -5,6 +5,7 @@
 
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
@@ -33,6 +34,7 @@
 #include <string>
 #include <system_error>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -40,10 +42,19 @@
 namespace cmath {
 namespace {
 
+using language::detail::IRDeclaration;
+using language::detail::IRAssignment;
 using language::detail::IRExpression;
+using language::detail::IRExpressionStatement;
 using language::detail::IRExprPtr;
 using language::detail::IRFunction;
 using language::detail::IRStatement;
+using language::detail::IRReturn;
+using language::detail::IRIf;
+using language::detail::IRWhile;
+using language::detail::IRFor;
+using language::detail::IRBreak;
+using language::detail::IRContinue;
 using language::detail::ProgramIR;
 using language::detail::ValueType;
 
@@ -268,11 +279,20 @@ private:
         const std::string& name,
         llvm::Type* type
     ) {
-        return builder_.CreateAlloca(
-            type,
-            nullptr,
-            name + ".addr"
+        auto* currentBlock = builder_.GetInsertBlock();
+
+        if (!currentBlock)
+            return nullptr;
+
+        auto* function = currentBlock->getParent();
+        auto& entryBlock = function->getEntryBlock();
+
+        llvm::IRBuilder<> entryBuilder(
+            &entryBlock, entryBlock.begin()
         );
+
+
+        return entryBuilder.CreateAlloca(type, nullptr, name+".addr");
     }
 
     llvm::Value* makeString(
@@ -623,20 +643,27 @@ private:
             }
 
             case IRExpression::Kind::Unary: {
-                const auto operandType =
-                    expression->children.front()->type;
+                if (expression->children.size() != 1 || !expression->children.front()) {
+                    error(expression->location, "CompileError", "Malformed unary expression in native code generation");
+                    return nullptr;
+                }
 
-                llvm::Value* operand =
-                    effectiveType == ValueType::Real
-                        ? emitRealExpression(
-                            expression->children.front()
-                        )
-                        : emitExpression(
-                            expression->children.front()
-                        );
+                const auto& operandExpression = expression->children.front();
+
+                auto* operand = emitExpression(operandExpression, operandExpression->type == ValueType::Rational ? ValueType::Real : ValueType::Error);
+                const auto operandType = operandExpression->type;
 
                 if (!operand)
                     return nullptr;
+
+                if (expression->text == "not") {
+                    if (!operand->getType()->isIntegerTy(1)) {
+                        error(expression->location, "TypeError", "'not' requires a Boolean operand");
+                        return nullptr;
+                    }
+
+                    return builder_.CreateNot(operand, "boolean.not");
+                }
 
                 if (expression->text == "+")
                     return operand;
@@ -698,13 +725,82 @@ private:
         return nullptr;
     }
 
+    llvm::Value* emitShortCircuit(const IRExprPtr& expression) {
+        if (!expression || expression->children.size() != 2 || !expression->children[0] || !expression->children[1]) {
+            error(expression ? expression->location : SourceLocation{}, "CompileError", "Malformed logical expression in native code generation");
+            return nullptr;
+        }
+
+        const bool isAnd = expression->text == "and";
+        auto *left = emitExpression(expression->children[0]);
+
+        if (!left) return nullptr;
+
+        if (!left->getType()->isIntegerTy(1)) {
+            error(expression->location, "TypeError", "Logical operations require Boolean operands");
+            return nullptr;
+        }
+
+        auto *function = builder_.GetInsertBlock()->getParent();
+
+        auto *shortCircuitBlock = llvm::BasicBlock::Create(context_, isAnd ? "and.short" : "or.short", function);
+
+        auto *rightBlock = llvm::BasicBlock::Create(context_, isAnd ? "and.rhs" : "or.rhs", function);
+        auto *mergeBlock = llvm::BasicBlock::Create(context_, isAnd ? "and.end" : "or.end", function);
+
+        if (isAnd) {
+            builder_.CreateCondBr(left, rightBlock, shortCircuitBlock);
+        } else {
+            builder_.CreateCondBr(left, shortCircuitBlock, rightBlock);
+        }
+
+        builder_.SetInsertPoint(shortCircuitBlock);
+        builder_.CreateBr(mergeBlock);
+
+        builder_.SetInsertPoint(rightBlock);
+        auto *right = emitExpression(expression->children[1]);
+
+        if (!right) {
+            return nullptr;
+        }
+
+        if (!right->getType()->isIntegerTy(1)) {
+            error(expression->location, "TypeError", "Logical operations require Boolean operands");
+            return nullptr;
+        }
+
+        auto *rightEndBlock = builder_.GetInsertBlock();
+
+        if (!rightEndBlock || rightEndBlock->getTerminator()) {
+            error(expression->location, "CompileError", "Logical right operand did not produce a continuing control-flow path");
+            return nullptr;
+        }
+
+        builder_.CreateBr(mergeBlock);
+
+        builder_.SetInsertPoint(mergeBlock);
+        auto *result = builder_.CreatePHI(builder_.getInt1Ty(), 2, isAnd ? "and.result" : "or.result");
+        result->addIncoming(llvm::ConstantInt::get(builder_.getInt1Ty(), isAnd ? 0 : 1), shortCircuitBlock);
+        result->addIncoming(right, rightEndBlock);
+
+        return result;
+    }
+
     llvm::Value* emitBinary(
         const IRExprPtr& expression,
         ValueType expected
     ) {
+        if (!expression || expression->children.size() != 2 || !expression->children[0] || !expression->children[1]) {
+            error(expression ? expression->location : SourceLocation{}, "CompileError", "Malformed binary expression in native code generation");
+            return nullptr;
+        }
+
         const auto& leftExpr = expression->children[0];
         const auto& rightExpr = expression->children[1];
         const std::string& op = expression->text;
+
+        if (op == "and" || op == "or")
+            return emitShortCircuit(expression);
 
         const bool comparison =
             op == "==" || op == "!=" ||
@@ -1589,132 +1685,279 @@ private:
         );
     }
 
-    bool emitStatement(
-        const IRStatement& statement
-    ) {
-        switch (statement.kind) {
-            case IRStatement::Kind::Declare: {
-                if (statement.type == ValueType::Unit) {
-                    error(
-                        statement.location,
-                        "CompileError",
-                        "Unit values cannot be stored in variables"
-                    );
+    bool currentBlockTerminated() const {
+        auto *block = builder_.GetInsertBlock();
+        return !block || block->getTerminator() != nullptr;
+    }
 
-                    return false;
-                }
+    bool emitBlock(const language::detail::IRBlock& block) {
+        auto previousVariables = variables_;
 
-                auto* type = llvmType(statement.type);
-
-                if (!type)
-                    return false;
-
-                auto* value = emitExpression(
-                    statement.expression,
-                    statement.type
-                );
-
-                if (!value)
-                    return false;
-
-                auto* address = createLocal(
-                    statement.name,
-                    type
-                );
-
-                builder_.CreateStore(value, address);
-
-                variables_[statement.name] = Variable{
-                    address,
-                    type,
-                    statement.type
-                };
-
-                return true;
-            }
-
-            case IRStatement::Kind::Assign: {
-                const auto found =
-                    variables_.find(statement.name);
-
-                if (found == variables_.end()) {
-                    error(
-                        statement.location,
-                        "CompileError",
-                        "Assignment target '" + statement.name +
-                            "' is not available in this native function"
-                    );
-
-                    return false;
-                }
-
-                auto* value = emitExpression(
-                    statement.expression,
-                    statement.type
-                );
-
-                if (!value)
-                    return false;
-
-                builder_.CreateStore(
-                    value,
-                    found->second.address
-                );
-
-                return true;
-            }
-
-            case IRStatement::Kind::Expression:
-                return emitExpression(statement.expression) != nullptr;
-
-            case IRStatement::Kind::Return: {
-                if (inMain_) {
-                    // Top-level returns exit main with code 0.
-                    if (
-                        statement.expression &&
-                        !emitExpression(statement.expression)
-                    ) {
-                        return false;
-                    }
-
-                    builder_.CreateRet(builder_.getInt32(0));
-                    terminated_ = true;
-
-                    return true;
-                }
-
-                if (
-                    statement.type == ValueType::Unit ||
-                    !statement.expression
-                ) {
-                    builder_.CreateRetVoid();
-                    terminated_ = true;
-
-                    return true;
-                }
-
-                auto* value = emitExpression(
-                    statement.expression,
-                    statement.type
-                );
-
-                if (!value)
-                    return false;
-
-                builder_.CreateRet(value);
-                terminated_ = true;
-
-                return true;
+        for (const auto & statement : block.statements) {
+            if (currentBlockTerminated())
+                break;
+            if (!emitStatement(statement)) {
+                variables_ = std::move(previousVariables);
+                return false;
             }
         }
 
-        error(
-            statement.location,
-            "CompileError",
-            "Unknown statement kind in native code generation"
-        );
+        variables_ = std::move(previousVariables);
+        return diagnostics_.empty();
+    }
 
-        return false;
+    bool emitIf(const language::detail::IRIf& conditional, const SourceLocation& location) {
+        auto *function = builder_.GetInsertBlock()->getParent();
+
+        auto *mergeBlock = llvm::BasicBlock::Create(context_, "if.end", function);
+
+        bool hasMergePredecessor = false;
+        for (const auto& branch : conditional.branches) {
+            if (!branch.condition || !branch.body) {
+                error(location, "CompileError", "Malformed conditional branch in native code generation");
+                return false;
+            }
+
+            auto *condition = emitExpression(branch.condition);
+
+            if (!condition)
+                return false;
+
+            if (!condition->getType()->isIntegerTy(1)) {
+                error(location, "TypeError", "An if/elif condition must evaluate to Boolean");
+                return false;
+            }
+
+            auto *bodyBlock = llvm::BasicBlock::Create(context_, "if.branch", function);
+
+            auto *nextConditionBlock = llvm::BasicBlock::Create(context_, "if.next", function);
+            builder_.CreateCondBr(condition, bodyBlock, nextConditionBlock);
+            builder_.SetInsertPoint(bodyBlock);
+
+            if (!emitBlock(*branch.body)) return false;
+
+            if (!currentBlockTerminated()) {
+                builder_.CreateBr(mergeBlock);
+                hasMergePredecessor = true;
+            }
+
+            builder_.SetInsertPoint(nextConditionBlock);
+        }
+
+        if (conditional.elseBody) {
+            if (!emitBlock(*conditional.elseBody)) return false;
+            if (!currentBlockTerminated()) {
+                builder_.CreateBr(mergeBlock);
+                hasMergePredecessor = true;
+            }
+        } else {
+            builder_.CreateBr(mergeBlock);
+            hasMergePredecessor = true;
+        }
+
+        builder_.SetInsertPoint(mergeBlock);
+
+        if (!hasMergePredecessor) builder_.CreateUnreachable();
+        
+        return true;
+    }  
+    
+    bool emitWhile(const language::detail::IRWhile& loop, const SourceLocation& location) {
+        if (!loop.condition || !loop.body) {
+            error(location, "CompileError", "Malformed while loop in native code generation");
+            return false;
+        }
+
+        auto *function = builder_.GetInsertBlock()->getParent();
+        auto *conditionBlock = llvm::BasicBlock::Create(context_, "while.condition", function);
+        auto *bodyBlock = llvm::BasicBlock::Create(context_, "while.body", function);
+
+        auto *exitBlock = llvm::BasicBlock::Create(context_, "while.end", function);
+        builder_.CreateBr(conditionBlock);
+        builder_.SetInsertPoint(conditionBlock);
+
+        auto *condition = emitExpression(loop.condition);
+        if (!condition) return false;
+
+        if (!condition->getType()->isIntegerTy(1)) {
+            error(location, "TypeError", "A while condition must evaluate to Boolean");
+            return false;
+        }
+
+        builder_.CreateCondBr(condition, bodyBlock, exitBlock);
+        loopTargets_.push_back(LoopTargets{exitBlock, conditionBlock});
+
+        const bool bodySucceeded = emitBlock(*loop.body);
+        loopTargets_.pop_back();
+
+        if (!bodySucceeded) return false;
+
+        if (!currentBlockTerminated()) builder_.CreateBr(conditionBlock);
+
+        builder_.SetInsertPoint(exitBlock);
+        return true;
+    }
+
+    bool emitFor(const language::detail::IRFor& loop, const SourceLocation& location) {
+        if (!loop.start || !loop.end || !loop.body) {
+            error(location, "CompileError", "Malformed for loop in native code generation");
+            return false;
+        }
+
+        auto *startValue = emitExpression(loop.start);
+        if (!startValue) return false;
+
+        auto *endValue = emitExpression(loop.end);
+        if (!endValue) return false;
+
+        if (!startValue->getType()->isIntegerTy(64) || !endValue->getType()->isIntegerTy(64)) {
+            error(location, "TypeError", "For-loop bounds must evaluate to Integer");
+            return false;
+        }
+
+        auto *function = builder_.GetInsertBlock()->getParent();
+
+        auto *iteratorAddress = createLocal(loop.iterator, builder_.getInt64Ty());
+
+        if (!iteratorAddress) return false;
+
+        builder_.CreateStore(startValue, iteratorAddress);
+        const auto previousVariables = variables_;
+        variables_[loop.iterator] = Variable{
+            iteratorAddress,
+            builder_.getInt64Ty(),
+            ValueType::Integer
+        };
+
+        auto *conditionBlock = llvm::BasicBlock::Create(context_, "for.condition", function);
+        auto *bodyBlock = llvm::BasicBlock::Create(context_, "for.body", function);
+        auto *incrementBlock = llvm::BasicBlock::Create(context_, "for.increment", function);
+        auto *exitBlock = llvm::BasicBlock::Create(context_, "for.end", function);
+
+        builder_.CreateBr(conditionBlock);
+        builder_.SetInsertPoint(conditionBlock);
+
+        auto *currentIndex = builder_.CreateLoad(builder_.getInt64Ty(), iteratorAddress, loop.iterator + ".current");
+        auto *condition = builder_.CreateICmpSLT(currentIndex, endValue, "for.condition.value");
+
+        builder_.CreateCondBr(condition, bodyBlock, exitBlock);
+        builder_.SetInsertPoint(bodyBlock);
+
+        loopTargets_.push_back(LoopTargets{exitBlock, incrementBlock});
+        const bool bodySucceeded = emitBlock(*loop.body);
+        if (!bodySucceeded) {
+            variables_ = previousVariables;
+            return false;
+        }
+
+        if (!currentBlockTerminated()) builder_.CreateBr(incrementBlock);
+
+        builder_.SetInsertPoint(incrementBlock);
+
+        auto* oldIndex = builder_.CreateLoad(builder_.getInt64Ty(), iteratorAddress, loop.iterator + ".increment.old");
+
+        auto* nextIndex = builder_.CreateAdd(oldIndex, builder_.getInt64(1), loop.iterator + ".increment");
+
+        builder_.CreateStore(nextIndex, iteratorAddress);
+        builder_.CreateBr(conditionBlock);
+
+        builder_.SetInsertPoint(exitBlock);
+
+        variables_ = previousVariables;
+        return true;
+    }
+
+
+    bool emitStatement(
+        const IRStatement& statement
+    ) {
+        if (currentBlockTerminated()) return true;
+        
+        return std::visit(
+            [this, &statement](const auto &node) -> bool {
+                using T = std::decay_t<decltype(node)>;
+
+                if constexpr(std::is_same_v<T, IRDeclaration>) {
+                    if (node.type == ValueType::Unit) {
+                        error(statement.location, "CompileError", "Unit values cannot be stored in variables");
+                        return false;
+                    }
+
+                    auto * type = llvmType(node.type);
+                    if (!type) return false;
+                    auto *value = emitExpression(node.initializer, node.type);
+                    if (!value) return false;
+                    auto *address = createLocal(node.name, type);
+                    if (!address) return false;
+
+                    builder_.CreateStore(value, address);
+                    variables_[node.name] = Variable{address, type, node.type};
+
+                    return true;
+                } else if constexpr(std::is_same_v<T, IRAssignment>) {
+                    const auto found = variables_.find(node.name);
+                    if (found == variables_.end()) {
+                        error(statement.location, "CompileError", "Assignment target '" + node.name + "' is not available in this native scope");
+                        return false;
+                    }
+
+                    auto *value = emitExpression(node.expression, node.type);
+
+                    if (!value) return false;
+
+                    builder_.CreateStore(value, found->second.address);
+                    return true;
+                } else if constexpr(std::is_same_v<T, IRExpressionStatement>) {
+                    return emitExpression(node.expression) != nullptr;
+                } else if constexpr(std::is_same_v<T, IRReturn>) {
+                    if (inMain_) {
+                        if(node.expression && !emitExpression(node.expression)) {
+                            return false;
+                        }
+                        builder_.CreateRet(builder_.getInt32(0));
+                        return true;
+                    }
+
+                    if (node.type == ValueType::Unit) {
+                        builder_.CreateRetVoid();
+                        return true;
+                    }
+
+                    if (!node.expression) {
+                        error(statement.location, "CompileError", "A non-Unit return requires a value");
+                        return false;
+                    }
+
+                    auto *value = emitExpression(node.expression, node.type);
+
+                    if (!value) return false;
+
+                    builder_.CreateRet(value);
+                    return true;
+                } else if constexpr(std::is_same_v<T, IRIf>) {
+                    return emitIf(node, statement.location);
+                } else if constexpr(std::is_same_v<T, IRWhile>) {
+                    return emitWhile(node, statement.location);
+                } else if constexpr(std::is_same_v<T, IRFor>) {
+                    return emitFor(node, statement.location);
+                } else if constexpr(std::is_same_v<T, IRBreak>) {
+                    if (loopTargets_.empty()) {
+                        error(statement.location, "ControlFlowError", "'break' appeared outside a generated loop");
+                        return false;
+                    }
+
+                    builder_.CreateBr(loopTargets_.back().breakBlock);
+                    return true;
+                } else if constexpr(std::is_same_v<T, IRContinue>) {
+                    if (loopTargets_.empty()) {
+                        error(statement.location, "ControlFlowError", "'continue' appeared outside a generated loop");
+                        return false;
+                    }
+                    builder_.CreateBr(loopTargets_.back().continueBlock);
+                    return true;
+                }
+            }, statement.data
+        );
     }
 
     bool emitFunction(
@@ -1738,7 +1981,6 @@ private:
 
         variables_.clear();
         inMain_ = false;
-        terminated_ = false;
 
         std::size_t index = 0;
 
@@ -1765,26 +2007,12 @@ private:
             };
         }
 
-        for (const auto& statement : sourceFunction.body) {
-            if (terminated_)
-                break;
-
-            if (!emitStatement(statement))
-                return false;
-        }
-
-        if (!terminated_) {
+        if (!emitBlock(sourceFunction.body)) return false;
+        if (!currentBlockTerminated()) {
             if (sourceFunction.returnType == ValueType::Unit) {
                 builder_.CreateRetVoid();
-                terminated_ = true;
             } else {
-                error(
-                    sourceFunction.location,
-                    "CompileError",
-                    "Native function '" + sourceFunction.name +
-                        "' has no terminating return"
-                );
-
+                error(sourceFunction.location, "CompileError", "Native function '" + sourceFunction.name + "' has a reachable path without a return value");
                 return false;
             }
         }
@@ -1814,77 +2042,22 @@ private:
         builder_.SetInsertPoint(entry);
 
         variables_.clear();
+        loopTargets_.clear();
         inMain_ = true;
-        terminated_ = false;
 
-        bool emissionSucceeded = true;
+        if (!emitBlock(program_.body)) return false;
 
-        for (
-            std::size_t i = 0;
-            i < program_.statements.size();
-            ++i
-        ) {
-            if (terminated_)
-                break;
-
-            const auto& statement =
-                program_.statements[i];
-
-            const auto previousDiagnosticCount =
-                diagnostics_.size();
-
-            const bool emitted =
-                emitStatement(statement);
-
-            if (!emitted) {
-                if (
-                    diagnostics_.size() ==
-                    previousDiagnosticCount
-                ) {
-                    error(
-                        statement.location,
-                        "CompileError",
-                        "Failed to generate native code for a top-level statement."
-                    );
-                }
-
-                emissionSucceeded = false;
-                break;
-            }
-        }
-
-        // Terminate main if it does not contain an explicit return.
-        if (!terminated_) {
-            builder_.CreateRet(builder_.getInt32(0));
-            terminated_ = true;
-        }
+        if (!currentBlockTerminated()) builder_.CreateRet(builder_.getInt32(0));
 
         inMain_ = false;
 
-        if (!emissionSucceeded || !diagnostics_.empty())
-            return false;
-
+        if (!diagnostics_.empty()) return false;
         std::string verificationMessage;
+        llvm::raw_string_ostream verificationStream(verificationMessage);
 
-        llvm::raw_string_ostream verificationStream(
-            verificationMessage
-        );
-
-        if (
-            llvm::verifyFunction(
-                *mainFunction,
-                &verificationStream
-            )
-        ) {
+        if (llvm::verifyFunction(*mainFunction, &verificationStream)) {
             verificationStream.flush();
-
-            error(
-                {},
-                "CompileError",
-                "Generated main failed verification: " +
-                    verificationMessage
-            );
-
+            error({}, "CompileError", "Generated main failed verification: " + verificationMessage);
             return false;
         }
 
@@ -1897,10 +2070,16 @@ private:
         ValueType typeKind = ValueType::Error;
     };
 
+    struct LoopTargets{
+        llvm::BasicBlock* breakBlock = nullptr;
+        llvm::BasicBlock* continueBlock = nullptr;
+    };
+
     llvm::LLVMContext& context_;
     std::unique_ptr<llvm::Module> module_;
     llvm::IRBuilder<> builder_;
     const ProgramIR& program_;
+    std::vector<LoopTargets> loopTargets_;
 
     std::vector<Diagnostic> diagnostics_;
 
@@ -1914,8 +2093,6 @@ private:
 
     std::unordered_map<std::string, llvm::FunctionCallee>
         mathFunctions_;
-
-    bool terminated_ = false;
     bool inMain_ = false;
 };
 
