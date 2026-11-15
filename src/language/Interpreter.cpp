@@ -240,6 +240,11 @@ namespace cmath::language::detail {
     }
 
     RuntimeValue Interpreter::evaluate(const IRExprPtr& expression, Environment& environment) {
+        if (!expression) {
+            runtimeError({}, "RuntimeError", "Attempted to evaluate an empty expression.");
+            return {};
+        }
+        
         if (!consumeInstruction(expression->location)) return {};
         try {
             switch (expression->kind) {
@@ -412,9 +417,32 @@ namespace cmath::language::detail {
                 }
 
                 case IRExpression::Kind::Binary: {
-                    auto left = evaluate(expression->children[0], environment);
+                    if (expression->children.size() != 2 || !expression->children[0] || !expression->children[1])
+                        throw RuntimeFault(expression->location, "RuntimeError", "Malformed binary expression.");
+
+                
+                    const auto& leftExpression = expression->children[0];
+                    const auto& rightExpression = expression->children[1];
+                    auto left = evaluate(leftExpression, environment);
                     if (!diagnostics_.empty()) return {};
-                    auto right = evaluate(expression->children[1], environment);
+                    if (expression->text == "and" || expression->text == "or") {
+                        if (left.type != ValueType::Boolean) 
+                            throw RuntimeFault(expression->location, "TypeError", "Logical operators require Boolean operands.");
+
+                        const bool leftValue = std::get<bool>(left.data);
+                        if (expression->text == "and" && !leftValue)
+                            return {ValueType::Boolean, false};
+                        if (expression->text == "or" && leftValue)
+                            return {ValueType::Boolean, true};
+                            
+                        auto right = evaluate(rightExpression, environment);
+                        if (!diagnostics_.empty()) return {};
+                        if (right.type != ValueType::Boolean)
+                            throw RuntimeFault(expression->location, "TypeError", "Logical operators require Boolean operands");
+                        return {ValueType::Boolean, std::get<bool>(right.data)};
+                    }
+                    
+                    auto right = evaluate(rightExpression, environment);
                     if (!diagnostics_.empty()) return {};
                     return applyBinary(expression->text, left, right, expression->type, expression->location);
                 }
@@ -445,6 +473,11 @@ namespace cmath::language::detail {
     }
 
     RuntimeValue Interpreter::applyUnary(const std::string& op, const RuntimeValue& value, const SourceLocation& location) {
+        if (op == "not") {
+            if (value.type != ValueType::Boolean)
+                throw RuntimeFault(location, "TypeError", "'not' requires a Boolean operand");
+            return {ValueType::Boolean, !std::get<bool>(value.data)};
+        }
         if (op == "+") return value;
         if (op == "-") {
             if (value.type == ValueType::Integer) {
@@ -753,66 +786,161 @@ namespace cmath::language::detail {
         }
 
         ++callDepth_;
-        RuntimeValue returnValue{ValueType::Unit, std::monostate{}};
-        bool returned = false;
-        for (const auto& statement: function.body) {
-            returnValue = executeStatement(statement, local, returned);
-            if (!diagnostics_.empty() || returned) break;
-        }
-
+        const auto execution = executeBlock(function.body, local);
         --callDepth_;
-        if (!returned && diagnostics_.empty())
-            throw RuntimeFault(location, "RuntimeError", "Function completed without returning a value");
-        return returnValue;
+        if (!diagnostics_.empty()) return {};
+        if (execution.flow == ControlFlow::Return) return execution.value;
+        if (execution.flow != ControlFlow::Normal)
+            throw RuntimeFault(location, "ControlFlowError", "Loop control escaped from function '" + name + "'");
+        if (function.returnType == ValueType::Unit)
+            return {ValueType::Unit, std::monostate{}};
+        
+        throw RuntimeFault(location, "RuntimeError", "Function completed without returning a value");
     }
 
-    RuntimeValue Interpreter::executeStatement(const IRStatement& statement, Environment& environment, bool& didReturn) {
+    Interpreter::StatementExecutionResult Interpreter::executeBlock(const IRBlock& block, Environment& environment)
+    {
+        for (const auto& statement : block.statements) {
+            auto result = executeStatement(statement, environment);
+            if (!diagnostics_.empty()) return {};
+            if (result.flow != ControlFlow::Normal) return result;
+        }
+        return {};
+    }
+
+    Interpreter::StatementExecutionResult Interpreter::executeStatement(const IRStatement& statement, Environment& environment) {
         if (!consumeInstruction(statement.location)) return {};
 
         try {
-            switch(statement.kind) {
-                case IRStatement::Kind::Declare: {
-                    auto value = evaluate(statement.expression, environment);
-                    if (!diagnostics_.empty()) return {};
-                    value = promote(value, statement.type, statement.location);
-                    environment.values[statement.name] = value;
-                    environment.mutableBindings[statement.name] = statement.mutableBinding;
-                    lastValue_ = format(value);
-                    return value;
-                }
+            return std::visit(
+                [this, &statement, &environment](const auto& node) -> StatementExecutionResult {
+                    using T = std::decay_t<decltype(node)>;
 
-                case IRStatement::Kind::Assign: {
-                    auto value = evaluate(statement.expression, environment);
-                    if (!diagnostics_.empty()) return {};
-                    value = promote(value, statement.type, statement.location);
-                    Environment* target = &environment;
-                    while (target && !target->values.contains(statement.name)) target = target->parent;
-                    if (!target || !target->mutableBindings[statement.name])
-                        throw RuntimeFault(statement.location, "RuntimeError", "Assignment target is not a mutable variable");
-                    target->values[statement.name] = value;
-                    lastValue_ = format(value);
-                    return value;
-                }
+                    if constexpr(std::is_same_v<T, IRDeclaration>) {
+                        auto value = evaluate(node.initializer, environment);
+                        if (!diagnostics_.empty()) return {};
+                        value = promote(value, node.type, statement.location);
+                        environment.values[node.name] = value;
+                        environment.mutableBinding[node.name] = node.mutableBinding;
+                        lastValue_ = format(value);
+                        return {};
+                    } else if constexpr(std::is_same_v<T, IRAssignment>) {
+                        auto value = evaluate(node.expression, environment);
+                        if (!diagnostics_.empty()) return {};
+                        value = promote(value, node.type, statement.locaiton);
 
-                case IRStatement::Kind::Expression: {
-                    auto value = evaluate(statement.expression, environment);
-                    if (value.type != ValueType::Unit) lastValue_ = format(value);
-                    return value;
-                }
+                        Environment* target = &environment;
+                        while (target && !target->values.contains(node.name)) 
+                            target = target->parent;
+                        
+                        if (!target)
+                            throw RuntimeFault(statement.location, "RuntimeError", "Assignment target '" + node.name + "' is unavailable");
 
-                case IRStatement::Kind::Return: {
-                    didReturn = true;
-                    if (!statement.expression) return {ValueType::Unit, std::monostate{}};
-                    auto value = evaluate(statement.expression, environment);
-                    if (!diagnostics_.empty()) return {};
-                    return promote(value, statement.type, statement.location);
-                }
-            }
+                        const auto mutableBinding = target->mutableBindings.find(node.name);
+                        if (mutableBinding == target->mutableBindings.end() || !mutableBinding->second) 
+                            throw RuntimeFault(statement.location, "MutabilityError", "Assignment target '" + node.name + "' is not mutable");
+
+                        target->values[node.name] = value;
+                        lastValue_ = format(value);
+                        return {};
+                    } else if constexpr(std::is_same_v<T, IRReturn>) {
+                        RuntimeValue value{ValueType::Unit, std::monostate{}};
+                        if (node.expression) {
+                            value = evaluate(node.expression, environment);
+                            if (!diagnostics_.empty()) return {};
+                            value = promote(value, node.type, statement.location);
+                        }
+                        return {ControlFlow::Return, value};
+                    } else if constexpr(std::is_same_v<T, IRIf>) {
+                        for (const auto& branch : node.branches) {
+                            if (!branch.condition || !branch.body) {
+                                throw RuntimeFault(statement.location, "RuntimeError", "Malformed conditional branch");
+                            }
+                            const auto condition = evaluate(branch.condition, environment);
+                            if (!diagnostics_.empty()) return {};
+                            if (condition.type != ValueType::Boolean) {
+                                throw RuntimeFault(statement.location, "TypeError", "Conditional expression did not evaluate to Boolean");
+                            }
+
+                            if (std::get<bool>(conditional.data)) {
+                                Environment branchEnvironment;
+                                branchEnvironment.parent = &environment;
+                                return executeBlock(*branch.body, branchEnvironment);
+                            }
+                        }
+
+                        if (node.elseBody) {
+                            Environment elseEnvironment;
+                            elseEnvironment.parent = &environment;
+                            return executeBlock(*node.elseBody, elseEnvironment);
+                        }
+                        return {};
+                    } else if constexpr(std::is_same_v<T, IRWhile>) {
+                        if (!node.condition || !node.body) {
+                            throw RuntimeFault(statement.location, "RuntimeError", "Malformed while loop");
+                        }
+                        while (true) {
+                            const auto condition = evaluate(node.condition, environment);
+                            if (!diagnostics_.empty()) return {};
+                            if (condition.type != ValueType::Boolean)
+                                throw RuntimeFault(statement.location, "TypeError", "While condition did not evaluate to Boolean");
+                            if (!std.get<bool>(condition.data)) break;
+                            if (!consumeInstruction(statement.location)) return {};
+
+                            Environment iterationEnvironment;
+                            iterationEnvironment.parent = &environment;
+                            const auto bodyResult = executeBlock(*node.body, iterationEnvironment);
+                            if (!diagnostics_.empty()) return {};
+                            if (bodyResult.flow == ControlFlow::Return) return bodyResult;
+                            if (bodyResult.flow == ControlFlow::Break) break;
+                        }
+                        return {};
+                    } else if constexpr(std::is_same_v<T, IRFor>) {
+                        if (!node.start || !node.end || !node.body) {
+                            throw RuntimeFault(statement.location, "RuntimeFault", "Malformed for loop");
+                        }
+
+                        const auto startValue = evaluate(node.start, environment);
+                        if (!diagnostics_.empty()) return {};
+                        const auto endValue = evaluate(node.end, environment);
+                        if (!diagnostics_.empty()) return {};
+                        if (startValue.type != ValueType::Integer || endValue.type != ValueType::Integer)
+                            throw RuntimeFault(statement.location, "TypeError" "For-loop bounds must evaluate to Integer");
+
+                        const auto start = std::get<std::int64_t>(startValue.data);
+                        const auto end = std::get<std::int64_t>(endValue.data);
+
+                        Environment iteratorEnvironment;
+                        iteratorEnvironment.parent = &environment;
+                        iteratorEnvironment.mutableBindings[node.iterator] = false;
+
+                        for (std::int64_t index = start; index < end;) {
+                            if (!consumeInstruction(statement.location)) return {};
+                            iteratorEnvironment.values[node.iterator] = {ValueType::Integer, index};
+
+                            Environment iterationEnvironment;
+                            iterationEnvironment.parent = &iteratorEnvironment;
+                            const auto bodyResult = executeBlock(*node.body, iterationEnvironment);
+                            if (!diagnostics_.empty()) return {};
+                            if (bodyResult.flow == ControlFlow::Return) return bodyResult;
+                            if (bodyResult.flow == ControlFlow::Break) break;
+                            ++index;
+                        }
+                        return {};
+                    } else if constexpr(std::is_same_v<T, IRBreak>) {
+                        return {ControlFlow::Break, {}};
+                    } else if constexpr(std::is_same_v<T, IRContinue>) {
+                        return {ControlFlow::Continue, {}};
+                    }
+                },
+                statement.data
+            );
         } catch (const RuntimeFault& fault) {
             runtimeError(fault.location, fault.diagnosticCode, fault.what());
         } catch (const std::exception& exception) {
             runtimeError(statement.location, "RuntimeError", exception.what());
         }
+
         return {};
     }
 
@@ -825,11 +953,11 @@ namespace cmath::language::detail {
         lastValue_.reset();
         diagnostics_.clear();
 
-        bool returned = false;
-        for (const auto& statement : program.statements) {
-            executeStatement(statement, globals_, returned);
-            if (!diagnostics_.empty()) break;
+        const auto execution = executeBlock(program.body, globals_);
+        if (diagnostics_.empty() && execution.flow != ControlFlow::Normal) {
+            runtimeError({}, "ControlFlowError", "Control flow escaped top-level program.");
         }
+
 
         return RuntimeResult{diagnostics_.empty(), std::move(output_), std::move(lastValue_), std::move(diagnostics_)};
     }
