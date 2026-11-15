@@ -6,6 +6,8 @@
 #include <numeric>
 #include <numbers>
 #include <sstream>
+#include <type_traits>
+#include <utility>
 #include <stdexcept>
 
 namespace cmath::language::detail {
@@ -821,13 +823,13 @@ namespace cmath::language::detail {
                         if (!diagnostics_.empty()) return {};
                         value = promote(value, node.type, statement.location);
                         environment.values[node.name] = value;
-                        environment.mutableBinding[node.name] = node.mutableBinding;
+                        environment.mutableBindings[node.name] = node.mutableBinding;
                         lastValue_ = format(value);
                         return {};
                     } else if constexpr(std::is_same_v<T, IRAssignment>) {
                         auto value = evaluate(node.expression, environment);
                         if (!diagnostics_.empty()) return {};
-                        value = promote(value, node.type, statement.locaiton);
+                        value = promote(value, node.type, statement.location);
 
                         Environment* target = &environment;
                         while (target && !target->values.contains(node.name)) 
@@ -843,6 +845,15 @@ namespace cmath::language::detail {
                         target->values[node.name] = value;
                         lastValue_ = format(value);
                         return {};
+                    } else if constexpr(std::is_same_v<T, IRExpressionStatement>) {
+                        auto value = evaluate(node.expresison, environment);
+                        if (!diagnostics_.empty()) return {};
+
+                        if (value.type != ValueType::Unit) 
+                            lastValue_ = format(value);
+                        
+                        return {};
+                    
                     } else if constexpr(std::is_same_v<T, IRReturn>) {
                         RuntimeValue value{ValueType::Unit, std::monostate{}};
                         if (node.expression) {
@@ -862,7 +873,7 @@ namespace cmath::language::detail {
                                 throw RuntimeFault(statement.location, "TypeError", "Conditional expression did not evaluate to Boolean");
                             }
 
-                            if (std::get<bool>(conditional.data)) {
+                            if (std::get<bool>(condition.data)) {
                                 Environment branchEnvironment;
                                 branchEnvironment.parent = &environment;
                                 return executeBlock(*branch.body, branchEnvironment);
@@ -884,7 +895,7 @@ namespace cmath::language::detail {
                             if (!diagnostics_.empty()) return {};
                             if (condition.type != ValueType::Boolean)
                                 throw RuntimeFault(statement.location, "TypeError", "While condition did not evaluate to Boolean");
-                            if (!std.get<bool>(condition.data)) break;
+                            if (!std::get<bool>(condition.data)) break;
                             if (!consumeInstruction(statement.location)) return {};
 
                             Environment iterationEnvironment;
@@ -905,7 +916,7 @@ namespace cmath::language::detail {
                         const auto endValue = evaluate(node.end, environment);
                         if (!diagnostics_.empty()) return {};
                         if (startValue.type != ValueType::Integer || endValue.type != ValueType::Integer)
-                            throw RuntimeFault(statement.location, "TypeError" "For-loop bounds must evaluate to Integer");
+                            throw RuntimeFault(statement.location, "TypeError", "For-loop bounds must evaluate to Integer");
 
                         const auto start = std::get<std::int64_t>(startValue.data);
                         const auto end = std::get<std::int64_t>(endValue.data);
