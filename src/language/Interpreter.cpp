@@ -574,6 +574,39 @@ namespace cmath::language::detail {
             throw RuntimeFault(location, "MemoryError", "Integer arithmetic overflows supported 64-bit range");
         }
 
+        if (op == "^" && (rightValue.type == ValueType::Complex || (leftValue.type == ValueType::Complex && rightValue.type != ValueType::Integer))) {
+            const auto base = std::get<std::complex<double>>(promote(leftValue, ValueType::Complex, location).data);
+            const auto exponent = std::get<std::complex<double>>(promote(rightValue, ValueType::Complex, location).data);
+
+            if (!std::isfinite(base.real()) || !std::isfinite(base.imag()) || !std::isfinite(exponent.real()) || !std::isfinite(exponent.imag())) {
+                throw RuntimeFault(location, "DomainError", "Complex exponentiation requires finite operands");
+            }
+
+            if (base == std::complex<double>(0.0, 0.0)) {
+                if (exponent == std::complex<double>(0.0, 0.0)) {
+                    return {ValueType::Complex, std::complex<double>(1.0, 0.0)};
+                } 
+
+                if (exponent.imag() != 0.0 || exponent.real() < 0.0) {
+                    throw RuntimeFault(location, "DomainError", "Zero cannot be raised to a negative or non-real power");
+                }
+
+                return {ValueType::Complex, std::complex<double>(0.0, 0.0)};
+            }
+
+            const auto result = std::pow(base, exponent);
+
+            if (std::isnan(result.real()) || std::isnan(result.imag())) {
+                throw RuntimeFault(location, "DomainError", "Complex exponentiation produced an undefined result");
+            }
+
+            if (!std::isfinite(result.real()) || !std::isfinite(result.imag())) {
+                throw RuntimeFault(location, "OverflowError", "Complex exponentiation overflowed");
+            }
+
+            return {ValueType::Complex, result};
+        }
+
         if (op == "^" && rightValue.type == ValueType::Integer) {
             const auto exponentValue = std::get<std::int64_t>(rightValue.data);
             if (resultType == ValueType::Rational) {

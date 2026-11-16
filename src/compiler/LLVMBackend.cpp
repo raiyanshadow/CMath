@@ -504,6 +504,9 @@ private:
             );
         }
 
+        mathFunctions_.emplace("hypot", declareFunction("hypot", doubleType, {doubleType, doubleType}));
+        mathFunctions_.emplace("atan2", declareFunction("atan2", doubleType, {doubleType, doubleType}));
+
         pow_ = declareFunction(
             "pow",
             doubleType,
@@ -1341,10 +1344,6 @@ private:
         }
 
         if (expression->type == ValueType::Complex) {
-            if (op == "^") {
-                error(expression->location, "FeatureError", "Complex exponentiation is not yet supported by the native backend");
-                return nullptr;
-            }
 
             auto* left = emitExpression(leftExpr, ValueType::Complex);
             auto* right = emitExpression(rightExpr, ValueType::Complex);
@@ -1425,6 +1424,77 @@ private:
                 resultImaginary->addIncoming(resultImaginaryA, realDominantEnd);
                 resultImaginary->addIncoming(resultImaginaryB, imaginaryDominantEnd);
 
+                return createComplex(resultReal, resultImaginary);
+            }
+
+            if (op == "^") {
+                const auto zero = llvm::ConstantFP::get(builder_.getDoubleTy(), 0.0);
+                const auto one = llvm::ConstantFP::get(builder_.getDoubleTy(), 1.0);
+
+                auto* realBaseIsZero = builder_.CreateFCmpOEQ(a, zero);
+                auto* imaginaryBaseIsZero = builder_.CreateFCmpOEQ(b, zero);
+
+                auto* baseIsZero = builder_.CreateAnd(realBaseIsZero, imaginaryBaseIsZero, "complex.power.zero.base");
+
+                auto* realExponentIsZero = builder_.CreateFCmpOEQ(c, zero);
+                auto* imaginaryExponentIsZero = builder_.CreateFCmpOEQ(d, zero);
+
+                auto* exponentIsZero = builder_.CreateAnd(realExponentIsZero, imaginaryExponentIsZero, "complex.power.zero.exponent");
+
+                auto* imaginaryExponentIsNonzero = builder_.CreateFCmpONE(d, zero);
+                auto* realExponentIsNegative = builder_.CreateFCmpOLT(c, zero);
+                auto* invalidZeroExponent = builder_.CreateOr(imaginaryExponentIsNonzero, realExponentIsNegative);
+                auto* invalidZeroPower = builder_.CreateAnd(baseIsZero, invalidZeroExponent);
+                emitAbortIf(invalidZeroPower, expression->location, "Zero cannot be raised to a negative or non-real power");
+
+                auto* realExponentUnordered = builder_.CreateFCmpUNO(c, c);
+                auto* imaginaryExponentUnordered = builder_.CreateFCmpUNO(d, d);
+
+                auto* invalidExponent = builder_.CreateOr(realExponentUnordered, imaginaryExponentUnordered);
+                auto* maximum = llvm::ConstantFP::get(builder_.getDoubleTy(), std::numeric_limits<double>::max());
+
+                auto* absoluteRealExponent = builder_.CreateCall(mathFunctions_.at("fabs"), {c});
+                auto* absoluteImaginaryExponent = builder_.CreateCall(mathFunctions_.at("fabs"), {d});
+
+                auto* realExponentTooLarge = builder_.CreateFCmpOGT(absoluteRealExponent, maximum);
+                auto* imgainaryExponentTooLarge = builder_.CreateFCmpOGT(absoluteImaginaryExponent, maximum);
+                invalidExponent = builder_.CreateOr(invalidExponent, builder_.CreateOr(realExponentTooLarge, imgainaryExponentTooLarge));
+
+                emitAbortIf(invalidExponent, expression->location, "Complex exponentiation requires finite exponent components");
+
+                auto* magnitude = builder_.CreateCall(mathFunctions_.at("hypot"), {a, b}, "complex.power.magnitude");
+                auto* argument = builder_.CreateCall(mathFunctions_.at("atan2"), {b, a}, "complex.power.argument");
+
+                auto* logMagnitude = builder_.CreateCall(mathFunctions_.at("log"), {magnitude}, "complex.power.log.magnitude");
+
+                auto* realProduct = builder_.CreateFSub(builder_.CreateFMul(c, logMagnitude), builder_.CreateFMul(d, argument), "complex.power.log.real");
+                auto* imaginaryProduct = builder_.CreateFAdd(builder_.CreateFMul(c, argument), builder_.CreateFMul(d, logMagnitude), "complex.power.log.imaginary");
+
+                auto* exponentialMagnitude = builder_.CreateCall(mathFunctions_.at("exp"), {realProduct}, "complex.power.exponential");
+                auto* cosine = builder_.CreateCall(mathFunctions_.at("cos"), {imaginaryProduct}, "complex.power.cosine");
+                auto* sine = builder_.CreateCall(mathFunctions_.at("sin"), {imaginaryProduct}, "complex.power.sine");
+
+                auto* resultReal = builder_.CreateFMul(exponentialMagnitude, cosine, "complex.power.result.real");
+                auto* resultImaginary = builder_.CreateFMul(exponentialMagnitude, sine, "complex.power.result.imaginary");
+
+                auto* zeroBaseNonzeroExponent = builder_.CreateAnd(baseIsZero, builder_.CreateNot(exponentIsZero));
+                resultReal = builder_.CreateSelect(zeroBaseNonzeroExponent, zero, resultReal);
+                resultImaginary = builder_.CreateSelect(zeroBaseNonzeroExponent, zero, resultImaginary);
+
+                resultReal = builder_.CreateSelect(exponentIsZero, one, resultReal);
+                resultImaginary = builder_.CreateSelect(exponentIsZero, zero, resultImaginary);
+
+                auto* realResultUnordered = builder_.CreateFCmpUNO(resultReal, resultReal);
+                auto* imaginaryResultUnordered = builder_.CreateFCmpUNO(resultImaginary, resultImaginary);
+
+                emitAbortIf(builder_.CreateOr(realResultUnordered, imaginaryResultUnordered), expression->location, "Complex exponentiation produced an undefined result");
+
+                auto* absoluteResultReal = builder_.CreateCall(mathFunctions_.at("fabs"), {resultReal});
+                auto* absoluteResultImaginary = builder_.CreateCall(mathFunctions_.at("fabs"), {resultImaginary});
+
+                auto* realOverflow = builder_.CreateFCmpOGT(absoluteResultReal, maximum);
+                auto* imaginaryOverflow = builder_.CreateFCmpOGT(absoluteResultImaginary, maximum);
+                emitAbortIf(builder_.CreateOr(realOverflow, imaginaryOverflow), expression->location, "Complex exponentiation overflowed");
                 return createComplex(resultReal, resultImaginary);
             }
         }

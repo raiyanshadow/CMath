@@ -303,14 +303,8 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
                         error(expression->location, "TypeError", "Operator '%' is defined only for Integer operands");
                     else result = ValueType::Integer;
                 } else if (op == "^") {
-                    if (right->type == ValueType::Complex) {
-                        error(expression->location, "TypeError", "Complex exponents are not supported yet");
-                    } else if (left->type == ValueType::Complex) {
-                        if (right->type != ValueType::Integer) {
-                            error(expression->location, "TypeError", "Complex bases currently support only Integer exponents");
-                        } else {
-                            result = ValueType::Complex;
-                        }
+                    if (right->type == ValueType::Complex || left->type == ValueType::Complex) {
+                        result = ValueType::Complex;
                     } else if (right->type == ValueType::Integer) {
                         if (left->type == ValueType::Integer) {
                             const auto knownExponent = constantReal(expression->children[1]);

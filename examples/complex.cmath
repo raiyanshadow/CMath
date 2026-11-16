@@ -34,3 +34,18 @@ print(Complex.i == Complex.Imaginary)
 
 print("=== Functions ===")
 print(combine(a, b))
+
+print("=== Complex exponentiation ===")
+
+print(Complex.i ^ 2)
+print(Complex.i ^ -2)
+print(Complex.i ^ 0.5)
+print((-1) ^ Complex.i)
+print(2 ^ Complex.i)
+print(Complex.i ^ Complex.i)
+print((1 + Complex.i) ^ (2 - Complex.i))
+
+print("=== Zero-base behavior ===")
+
+print(0 ^ 0)
+print(0 ^ 2)
