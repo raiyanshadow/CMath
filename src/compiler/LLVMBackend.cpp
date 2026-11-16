@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <memory>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -56,7 +57,105 @@ using language::detail::IRFor;
 using language::detail::IRBreak;
 using language::detail::IRContinue;
 using language::detail::ProgramIR;
+using language::detail::RationalValue;
 using language::detail::ValueType;
+
+bool checkedMul64(std::int64_t a, std::int64_t b, std::int64_t& result) {
+    if (a == 0 || b == 0) {
+        result = 0;
+        return true;
+    }
+
+    if ((a == -1 && b == std::numeric_limits<std::int64_t>::min()) || 
+        (b == -1 && a == std::numeric_limits<std::int64_t>::min())) {
+            return false;
+        }
+
+    if (a > 0) {
+        if (b > 0) {
+            if (a > std::numeric_limits<std::int64_t>::max() / b) return false;
+        } else {
+            if (b < std::numeric_limits<std::int64_t>::min() / a) return false;
+        }
+    } else {
+        if (b > 0) {
+            if (a < std::numeric_limits<std::int64_t>::min() / b) return false;
+        } else {
+            if (a < std::numeric_limits<std::int64_t>::max() / b) return false;
+        }
+    }
+
+    result = a * b;
+    return true;
+}
+
+bool checkedAdd64(std::int64_t a, std::int64_t b, std::int64_t& result) {
+    if ((b > 0 && a > std::numeric_limits<std::int64_t>::max() - b) ||
+        (b < 0 && a < std::numeric_limits<std::int64_t>::min() - b)) {
+            return false;
+        }
+
+        result = a + b;
+        return true;
+}
+
+RationalValue parseRationalLiteral(const std::string& text) {
+    const auto dot = text.find('.');
+
+    if (dot == std::string::npos) {
+        std::size_t consumed = 0;
+        const auto numerator = std::stoll(text, &consumed);
+
+        if (consumed != text.size()) 
+            throw std::invalid_argument("Invalid Rational literal");
+
+        return {numerator, 1};
+    }
+
+    const std::string wholeText = text.substr(0, dot);
+    const std::string fractionalText = text.substr(dot+1);
+
+    std::int64_t denominator = 1;
+
+    for (std::size_t i = 0; i < fractionalText.size(); ++i) {
+        if (!checkedMul64(denominator, 10, denominator)) {
+            throw std::out_of_range("Rational literal exceeds the supported exact range");
+        }
+    }
+
+    std::int64_t whole = 0;
+
+    if (!wholeText.empty()) {
+        std::size_t consumed = 0;
+        whole = std::stoll(wholeText, &consumed);
+
+        if (consumed != wholeText.size())
+            throw std::invalid_argument("Invalid Rational literal");
+    }
+
+    std::int64_t fractional = 0;
+
+    if (!fractionalText.empty()) {
+        std::size_t consumed = 0;
+        fractional = std::stoll(fractionalText, &consumed);
+
+        if (consumed != fractionalText.size())
+            throw std::invalid_argument("Invalid Rational literal");
+    }
+
+    std::int64_t scaledWhole = 0;
+    std::int64_t numerator = 0;
+
+    if (!checkedMul64(whole, denominator, scaledWhole) ||
+        !checkedAdd64(scaledWhole, fractional, numerator)) {
+        throw std::out_of_range("Rational literal exceeds the supported exact range");
+    }
+
+    const auto divisor = std::gcd(numerator, denominator);
+
+    return {numerator/divisor, denominator/divisor};
+}
+
 
 class ModuleGenerator {
 public:
@@ -108,6 +207,194 @@ private:
         );
     }
 
+    llvm::StructType* rationalLLVMType() {
+        if (!rationalType_) {
+            rationalType_ = llvm::StructType::create(context_, "cmath.Rational");
+            rationalType_->setBody({builder_.getInt64Ty(), builder_.getInt64Ty()}, false);
+        }
+
+        return rationalType_;
+    }
+
+    llvm::Value* createRational(llvm::Value* numerator, llvm::Value* denominator) {
+        auto* undefResult = llvm::UndefValue::get(rationalLLVMType());
+        auto* result = builder_.CreateInsertValue(undefResult, numerator, {0}, "rational.numerator");
+        return builder_.CreateInsertValue(result, denominator, {1}, "rational.denominator");
+    }
+
+    llvm::Function* rationalDivModFunction() {
+        if (rationalDivMod_)
+            return rationalDivMod_;
+        
+        auto* integerType = llvm::IntegerType::get(context_, 128);
+
+        rationalDivModType_ = llvm::StructType::get(context_, {integerType, integerType});
+        auto* functionType = llvm::FunctionType::get(rationalDivModType_, {integerType, integerType}, false);
+
+        rationalDivMod_ = llvm::Function::Create(functionType, llvm::Function::InternalLinkage, "cmath.rational.divmod", module_.get());
+
+        auto argument = rationalDivMod_->arg_begin();
+        llvm::Value* dividend = &*argument++;
+        llvm::Value* divisor = &*argument;
+
+        auto* entry = llvm::BasicBlock::Create(context_, "entry", rationalDivMod_);
+        auto* zeroBlock = llvm::BasicBlock::Create(context_, "divisor.zero", rationalDivMod_);
+        auto* loopBlock = llvm::BasicBlock::Create(context_, "divmod.loop", rationalDivMod_);
+        auto* exitBlock = llvm::BasicBlock::Create(context_, "divmod.exit", rationalDivMod_);
+
+        llvm::IRBuilder<> helperBuilder(context_);
+
+        auto* zero = llvm::ConstantInt::get(integerType, 0);
+        auto* one = llvm::ConstantInt::get(integerType, 1);
+
+        helperBuilder.SetInsertPoint(entry);
+
+        auto* divisorIsZero = helperBuilder.CreateICmpEQ(divisor, zero);
+        helperBuilder.CreateCondBr(divisorIsZero, zeroBlock, loopBlock);
+
+        helperBuilder.SetInsertPoint(zeroBlock);
+        auto* undefZeroResult = llvm::UndefValue::get(rationalDivModType_);
+        auto* zeroResult = helperBuilder.CreateInsertValue(undefZeroResult, zero, {0});
+        zeroResult = helperBuilder.CreateInsertValue(zeroResult, dividend, {1});
+        helperBuilder.CreateRet(zeroResult);
+
+        helperBuilder.SetInsertPoint(loopBlock);
+
+        auto* bitIndex = helperBuilder.CreatePHI(helperBuilder.getInt32Ty(), 2, "divmod.bit.index");
+        auto* quotient = helperBuilder.CreatePHI(integerType, 2, "divmod.quotient");
+        auto* remainder = helperBuilder.CreatePHI(integerType, 2, "divmod.remainder");
+        bitIndex->addIncoming(helperBuilder.getInt32(127), entry);
+
+        quotient->addIncoming(zero, entry);
+        remainder->addIncoming(zero, entry);
+
+        auto* shiftAmount = helperBuilder.CreateZExt(bitIndex, integerType);
+        auto* shiftedDividend = helperBuilder.CreateLShr(dividend, shiftAmount);
+
+        auto* currentBit = helperBuilder.CreateAnd(shiftedDividend, one);
+        auto* shiftedRemainder = helperBuilder.CreateShl(remainder, one);
+        auto* candidateRemainder = helperBuilder.CreateOr(shiftedRemainder, currentBit);
+        auto* canSubtract = helperBuilder.CreateICmpUGE(candidateRemainder, divisor);
+        auto* subtractedRemainder = helperBuilder.CreateSub(candidateRemainder, divisor);
+        auto* nextRemainder = helperBuilder.CreateSelect(canSubtract, subtractedRemainder, candidateRemainder);
+
+        auto* bitMask = helperBuilder.CreateShl(one, shiftAmount);
+        auto* updatedQuotient = helperBuilder.CreateOr(quotient, bitMask);
+        auto* nextQuotient = helperBuilder.CreateSelect(canSubtract, updatedQuotient, quotient);
+        
+        auto* finished = helperBuilder.CreateICmpEQ(bitIndex, helperBuilder.getInt32(0));
+        auto* nextBitIndex = helperBuilder.CreateSub(bitIndex, helperBuilder.getInt32(1));
+
+        helperBuilder.CreateCondBr(finished, exitBlock, loopBlock);
+
+        bitIndex->addIncoming(nextBitIndex, loopBlock);
+        quotient->addIncoming(nextQuotient, loopBlock);
+        remainder->addIncoming(nextRemainder, loopBlock);
+
+        helperBuilder.SetInsertPoint(exitBlock);
+
+        auto* undefResult = llvm::UndefValue::get(rationalDivModType_);
+        auto* result = helperBuilder.CreateInsertValue(undefResult, nextQuotient, {0});
+        result = helperBuilder.CreateInsertValue(result, nextRemainder, {1});
+        helperBuilder.CreateRet(result);
+
+        return rationalDivMod_;
+    }
+
+    llvm::Function* rationalGcdFunction() {
+        if (rationalGcd_)
+            return rationalGcd_;
+        
+        auto* integerType = llvm::IntegerType::get(context_, 128);
+
+        auto* functionType = llvm::FunctionType::get(integerType, {integerType, integerType}, false);
+
+        rationalGcd_ = llvm::Function::Create(functionType, llvm::GlobalValue::InternalLinkage, "cmath.rational.gcd", module_.get());
+
+        auto argument = rationalGcd_->arg_begin();
+
+        llvm::Value* initialA = &*argument++;
+        llvm::Value* initialB = &*argument;
+
+        auto* entry = llvm::BasicBlock::Create(context_, "entry", rationalGcd_);
+        auto* loop = llvm::BasicBlock::Create(context_, "gcd.loop", rationalGcd_);
+        auto* step = llvm::BasicBlock::Create(context_, "gcd.step", rationalGcd_);
+        auto* exit = llvm::BasicBlock::Create(context_, "gcd.exit", rationalGcd_);
+
+        llvm::IRBuilder<> helperBuilder(context_);
+
+        helperBuilder.SetInsertPoint(entry);
+        helperBuilder.CreateBr(loop);
+
+        helperBuilder.SetInsertPoint(loop);
+
+        auto* a = helperBuilder.CreatePHI(integerType, 2, "gcd.a");
+
+        auto* b = helperBuilder.CreatePHI(integerType, 2, "gcd.b");
+
+        a->addIncoming(initialA, entry);
+        b->addIncoming(initialB, entry);
+
+        auto* finished = helperBuilder.CreateICmpEQ(b, llvm::ConstantInt::get(integerType, 0));
+
+        helperBuilder.CreateCondBr(finished, exit, step);
+        helperBuilder.SetInsertPoint(step);
+
+        auto* division = helperBuilder.CreateCall(rationalDivModFunction(), {a, b}, "gcd.division");
+        auto* remainder = helperBuilder.CreateExtractValue(division, {1}, "gcd.remainder");
+
+        helperBuilder.CreateBr(loop);
+
+        a->addIncoming(b, step);
+        b->addIncoming(remainder, step);
+
+        helperBuilder.SetInsertPoint(exit);
+        helperBuilder.CreateRet(a);
+
+        return rationalGcd_;
+    }
+
+    llvm::Value* emitRationalNormalize(llvm::Value* numerator, llvm::Value* denominator, const SourceLocation& location) {
+        auto* integerType = llvm::IntegerType::get(context_, 128);
+
+        auto* zero = llvm::ConstantInt::get(integerType, 0);
+        auto* denominatorIsZero = builder_.CreateICmpEQ(denominator, zero);
+
+        emitAbortIf(denominatorIsZero, location, "Rational division by zero");
+
+        auto* denominatorIsNegative = builder_.CreateICmpSLT(denominator, zero);
+        auto* negativeNumerator = builder_.CreateNeg(numerator);
+        auto* negativeDenominator = builder_.CreateNeg(denominator);
+
+        numerator = builder_.CreateSelect(denominatorIsNegative, negativeNumerator, numerator);
+        denominator = builder_.CreateSelect(denominatorIsNegative, negativeDenominator, denominator);
+
+        auto* numeratorIsNegative = builder_.CreateICmpSLT(numerator, zero);
+        auto* absoluteNumerator = builder_.CreateSelect(numeratorIsNegative, builder_.CreateNeg(numerator), numerator, "rational.absolute.numerator");
+        auto* divisor = builder_.CreateCall(rationalGcdFunction(), {absoluteNumerator, denominator}, "rational.gcd");
+
+        auto* numeratorDivision = builder_.CreateCall(rationalDivModFunction(), {absoluteNumerator, divisor}, "rational.numerator.division");
+        auto* reducedAbsoluteNumerator = builder_.CreateExtractValue(numeratorDivision, {0}, "rational.reduced.absolute.numerator");
+        auto* reducedNumerator = builder_.CreateSelect(numeratorIsNegative, builder_.CreateNeg(reducedAbsoluteNumerator), reducedAbsoluteNumerator, "rational.reduced.numerator");
+        
+        auto* denominatorDivision = builder_.CreateCall(rationalDivModFunction(), {denominator, divisor}, "rational.denominator.division");
+        auto* reducedDenominator = builder_.CreateExtractValue(denominatorDivision, {0}, "rational.reduced.denominator");
+
+        const auto minimum = llvm::ConstantInt::getSigned(integerType, std::numeric_limits<std::int64_t>::min());
+        const auto maximum = llvm::ConstantInt::getSigned(integerType, std::numeric_limits<std::int64_t>::max());
+
+        auto* numeratorTooSmall = builder_.CreateICmpSLT(reducedNumerator, minimum);
+        auto* numeratorTooLarge = builder_.CreateICmpSGT(reducedNumerator, maximum);
+        auto* denominatorTooLarge = builder_.CreateICmpUGT(reducedDenominator, maximum);
+
+        auto* invalid = builder_.CreateOr(numeratorTooSmall, builder_.CreateOr(numeratorTooLarge, denominatorTooLarge));
+
+        emitAbortIf(invalid, location, "Rational arithmetic overflows the supported 64-bit range");
+        auto* numerator64 = builder_.CreateTrunc(reducedNumerator, builder_.getInt64Ty(), "rational.numerator.i64");
+        auto* denominator64 = builder_.CreateTrunc(reducedDenominator, builder_.getInt64Ty(), "rational.denominator.i64");
+        return createRational(numerator64, denominator64);
+    }
+
     llvm::Type* llvmType(ValueType type) {
         switch (type) {
             case ValueType::Integer:
@@ -126,12 +413,7 @@ private:
                 return builder_.getVoidTy();
 
             case ValueType::Rational:
-                error(
-                    {},
-                    "FeatureError",
-                    "Native code generation does not yet support exact Rational storage. A Rational value can be widened to Real"
-                );
-                return nullptr;
+                return rationalLLVMType();
 
             case ValueType::Complex:
                 error(
@@ -187,6 +469,12 @@ private:
             builder_.getVoidTy(),
             {},
             false
+        );
+
+        fflush_ = declareFunction(
+            "fflush",
+            builder_.getInt32Ty(),
+            {builder_.getPtrTy()}
         );
 
         strcmp_ = declareFunction(
@@ -365,6 +653,10 @@ private:
         if (from == to)
             return value;
 
+        if (to == ValueType::Rational && from == ValueType::Integer) {
+            return createRational(value, builder_.getInt64(1));
+        }
+
         if (to == ValueType::Real && from == ValueType::Integer) {
             return builder_.CreateSIToFP(
                 value,
@@ -373,8 +665,15 @@ private:
             );
         }
 
-        if (to == ValueType::Real && from == ValueType::Rational)
-            return value;
+        if (to == ValueType::Real && from == ValueType::Rational) {
+            auto* numerator = builder_.CreateExtractValue(value, {0});
+            auto* denominator = builder_.CreateExtractValue(value, {1});
+
+            auto* numeratorReal = builder_.CreateSIToFP(numerator, builder_.getDoubleTy());
+            auto* denominatorReal = builder_.CreateSIToFP(denominator, builder_.getDoubleTy());
+
+            return builder_.CreateFDiv(numeratorReal, denominatorReal, "rational.to.real");
+        }
 
         error(
             location,
@@ -447,27 +746,20 @@ private:
                     }
                 }
 
-                if (
-                    expression->type == ValueType::Rational &&
-                    expected == ValueType::Real
-                ) {
+                if (expression->type == ValueType::Rational) {
                     try {
-                        const auto value = std::stod(
-                            expression->text
-                        );
+                        const auto rational = parseRationalLiteral(expression->text);
+                        auto* constant = llvm::ConstantStruct::get(rationalLLVMType(), {
+                            llvm::ConstantInt::getSigned(builder_.getInt64Ty(), rational.numerator),
+                            llvm::ConstantInt::getSigned(builder_.getInt64Ty(), rational.denominator)
+                        });
 
-                        if (!std::isfinite(value))
-                            throw std::out_of_range("non-finite");
-
-                        return llvm::ConstantFP::get(
-                            builder_.getDoubleTy(),
-                            value
-                        );
+                        return coerce(constant, ValueType::Rational, effectiveType, expression->location);
                     } catch (...) {
                         error(
                             expression->location,
                             "CompileError",
-                            "Cannot approximate this Rational literal as a Real value"
+                            "Rational literal exceeds the supported exact 64-bit range"
                         );
 
                         return nullptr;
@@ -570,14 +862,7 @@ private:
                 }
 
                 if (found->second.typeKind != effectiveType) {
-                    error(
-                        expression->location,
-                        "FeatureError",
-                        "Native variable type conversion is not supported for '" +
-                            expression->text + "'"
-                    );
-
-                    return nullptr;
+                    return coerce(loaded, found->second.typeKind, effectiveType, expression->location);
                 }
 
                 return loaded;
@@ -681,6 +966,18 @@ private:
                             operand,
                             "integer.negate"
                         );
+                    }
+
+                    if (operandType == ValueType::Rational && effectiveType == ValueType::Rational) {
+                        auto* numerator = builder_.CreateExtractValue(operand, {0}, "rational.negate.numerator");
+                        auto* denominator = builder_.CreateExtractValue(operand, {1}, "rational.negate.denominator");
+                        auto* minimum = llvm::ConstantInt::getSigned(builder_.getInt64Ty(), std::numeric_limits<std::int64_t>::min());
+                        auto* overflows = builder_.CreateICmpEQ(numerator, minimum, "rational.negate.overflow");
+
+                        emitAbortIf(overflows, expression->location, "Rational negation overflows the supported 64-bit range");
+
+                        auto* negatedNumerator = builder_.CreateNeg(numerator, "rational.negate");
+                        return createRational(negatedNumerator, denominator);
                     }
                 }
 
@@ -885,26 +1182,38 @@ private:
                 return nullptr;
             }
 
-            if (
-                (leftType == ValueType::Rational ||
-                 rightType == ValueType::Rational) &&
-                leftType != ValueType::Real &&
-                rightType != ValueType::Real
-            ) {
-                error(
-                    expression->location,
-                    "FeatureError",
-                    "Comparing Rational values without a Real operand requires exact Rational support, which is not yet available in the native backend"
-                );
-
-                return nullptr;
-            }
-
             const bool useReal =
                 leftType == ValueType::Real ||
-                rightType == ValueType::Real ||
-                leftType == ValueType::Rational ||
-                rightType == ValueType::Rational;
+                rightType == ValueType::Real;
+
+            if (!useReal && (leftType == ValueType::Rational || rightType == ValueType::Rational)) {
+                auto* left = emitExpression(leftExpr, ValueType::Rational);
+                auto* right = emitExpression(rightExpr, ValueType::Rational);
+                if (!left || !right) 
+                    return nullptr;
+
+                auto* leftNumerator = builder_.CreateSExt(builder_.CreateExtractValue(left, {0}), llvm::IntegerType::get(context_, 128));
+                auto* leftDenominator = builder_.CreateSExt(builder_.CreateExtractValue(left, {1}), llvm::IntegerType::get(context_, 128));
+
+                auto* rightNumerator = builder_.CreateSExt(builder_.CreateExtractValue(right, {0}), llvm::IntegerType::get(context_, 128));
+                auto* rightDenominator = builder_.CreateSExt(builder_.CreateExtractValue(right, {1}), llvm::IntegerType::get(context_, 128));
+
+                auto* leftCrossProduct = builder_.CreateMul(leftNumerator, rightDenominator);
+                auto* rightCrossProduct = builder_.CreateMul(rightNumerator, leftDenominator);
+
+                if (op == "==")
+                    return builder_.CreateICmpEQ(leftCrossProduct, rightCrossProduct);
+                if (op == "!=")
+                    return builder_.CreateICmpNE(leftCrossProduct, rightCrossProduct);
+                if (op == "<")
+                    return builder_.CreateICmpSLT(leftCrossProduct, rightCrossProduct);
+                if (op == ">")
+                    return builder_.CreateICmpSGT(leftCrossProduct, rightCrossProduct);
+                if (op == "<=")
+                    return builder_.CreateICmpSLE(leftCrossProduct, rightCrossProduct);
+                
+                return builder_.CreateICmpSGE(leftCrossProduct, rightCrossProduct);
+            }
 
             llvm::Value* left =
                 useReal
@@ -967,9 +1276,48 @@ private:
             effectiveType = ValueType::Real;
         }
 
+        if (effectiveType == ValueType::Rational) {
+            if (op == "^") {
+                auto* left = emitExpression(leftExpr, ValueType::Rational);
+                auto* right = emitExpression(rightExpr, ValueType::Integer);
+
+                if (!left || !right)
+                    return nullptr;
+
+                return builder_.CreateCall(
+                    rationalPowerFunction(),
+                    {left, right},
+                    "rational.power"
+                );
+            }
+
+            auto* left = emitExpression(leftExpr, ValueType::Rational);
+            auto* right = emitExpression(rightExpr, ValueType::Rational);
+
+            if (!left || !right)
+                return nullptr;
+
+            return emitRationalOperation(
+                op,
+                left,
+                right,
+                expression->location
+            );
+        }
+
         if (effectiveType == ValueType::Real) {
             auto* left = emitRealExpression(leftExpr);
-            auto* right = emitRealExpression(rightExpr);
+
+            llvm::Value* rationalExponent = nullptr;
+            llvm::Value* right = nullptr;
+
+            if (op == "^" && rightExpr->type == ValueType::Rational) {
+                rationalExponent = emitExpression(rightExpr, ValueType::Rational);
+                if (!rationalExponent) return nullptr;
+                right = coerce(rationalExponent, ValueType::Rational, ValueType::Real, expression->location);
+            } else {
+                right = emitRealExpression(rightExpr);
+            }
 
             if (!left || !right)
                 return nullptr;
@@ -1002,11 +1350,39 @@ private:
                 return builder_.CreateFRem(left, right, "real.remainder");
 
             if (op == "^") {
-                return builder_.CreateCall(
-                    pow_,
-                    {left, right},
-                    "real.power"
-                );
+                const auto zero = llvm::ConstantFP::get(builder_.getDoubleTy(), 0.0);
+                auto* baseIsZero = builder_.CreateFCmpOEQ(left, zero);
+                llvm::Value* result = nullptr;
+                
+                if (rationalExponent) {
+                    auto* exponentNumerator = builder_.CreateExtractValue(rationalExponent, {0});
+                    auto* exponentDenominator = builder_.CreateExtractValue(rationalExponent, {1});
+                    auto* exponentIsNegative = builder_.CreateICmpSLT(exponentNumerator, builder_.getInt64(0));
+                    emitAbortIf(builder_.CreateAnd(baseIsZero, exponentIsNegative), expression->location, "Zero cannot be raised to a negative power");
+
+                    auto* baseIsNegative = builder_.CreateFCmpOLT(left, zero);
+                    auto* denominatorIsEven = builder_.CreateICmpEQ(builder_.CreateAnd(exponentDenominator, builder_.getInt64(1)), builder_.getInt64(0));
+                    emitAbortIf(builder_.CreateAnd(baseIsNegative, denominatorIsEven), expression->location, "Negative base with an even-denominator Rational exponent has no real result");
+
+                    auto* absoluteBase = builder_.CreateSelect(baseIsNegative, builder_.CreateFNeg(left), left, "power.absolute.base");
+                    auto* magnitude = builder_.CreateCall(pow_, {absoluteBase, right}, "rational.power.magnitude");
+                    auto* exponentNumeratorIsOdd = builder_.CreateICmpNE(builder_.CreateAnd(exponentNumerator, builder_.getInt64(1)), builder_.getInt64(0));
+                    auto* negateResult = builder_.CreateAnd(baseIsNegative, exponentNumeratorIsOdd);
+
+                    result = builder_.CreateSelect(negateResult, builder_.CreateFNeg(magnitude), magnitude, "rational.power.result");
+                } else {
+                    auto* exponentIsNegative = builder_.CreateFCmpOLT(right, zero);
+                    emitAbortIf(builder_.CreateAnd(baseIsZero, exponentIsNegative), expression->location, "Zero cannot be raised to a negative power");
+                    result = builder_.CreateCall(pow_, {left, right}, "real.power");
+                }
+                auto* unordered = builder_.CreateFCmpUNO(result, result);
+                emitAbortIf(unordered, expression->location, "Real exponential is outside the Real domain");
+                auto* absoluteResult = builder_.CreateCall(mathFunctions_.at("fabs"), {result}, "power.absolute.result");
+                auto* maximum = llvm::ConstantFP::get(builder_.getDoubleTy(), std::numeric_limits<double>::max());
+
+                emitAbortIf(builder_.CreateFCmpOGT(absoluteResult, maximum), expression->location, "Real exponentiation overflowed");
+
+                return result;
             }
         } else if (effectiveType == ValueType::Integer) {
             auto* left = emitExpression(leftExpr);
@@ -1237,6 +1613,269 @@ private:
         return nullptr;
     }
 
+    llvm::Value* emitRationalOperation(const std::string& op, llvm::Value* left, llvm::Value* right, const SourceLocation& location) {
+        auto* leftNumerator64 = builder_.CreateExtractValue(left, {0});
+        auto* leftDenominator64 = builder_.CreateExtractValue(left, {1});
+        
+        auto* rightNumerator64 = builder_.CreateExtractValue(right, {0});
+        auto* rightDenominator64 = builder_.CreateExtractValue(right, {1});
+
+        auto* integerType = llvm::IntegerType::get(context_, 128);
+
+        auto* leftNumerator = builder_.CreateSExt(leftNumerator64, integerType);
+        auto* leftDenominator = builder_.CreateSExt(leftDenominator64, integerType);
+        auto* rightNumerator = builder_.CreateSExt(rightNumerator64, integerType);
+        auto* rightDenominator = builder_.CreateSExt(rightDenominator64, integerType);
+
+        llvm::Value* numerator = nullptr;
+        llvm::Value* denominator = nullptr;
+
+        if (op == "+") {
+            numerator = builder_.CreateAdd(builder_.CreateMul(leftNumerator, rightDenominator), 
+                                           builder_.CreateMul(rightNumerator, leftDenominator), "rational.add.numerator");
+            denominator = builder_.CreateMul(leftDenominator, rightDenominator, "rational.add.denominator");
+        } else if (op == "-") {
+            numerator = builder_.CreateSub(builder_.CreateMul(leftNumerator, rightDenominator),
+                                           builder_.CreateMul(rightNumerator, leftDenominator), "rational.subtract.numerator");
+            denominator = builder_.CreateMul(leftDenominator, rightDenominator, "rational.subtract.denominator");
+        } else if (op == "*") {
+            numerator = builder_.CreateMul(leftNumerator, rightNumerator, "rational.multiply.numerator");
+            denominator = builder_.CreateMul(leftDenominator, rightDenominator, "rational.multiply.denominator");
+        } else if (op == "/") {
+            auto* divisionByZero = builder_.CreateICmpEQ(rightNumerator64, builder_.getInt64(0));
+            emitAbortIf(divisionByZero, location, "Rational division by zero");
+            numerator = builder_.CreateMul(leftNumerator, rightDenominator, "rational.divide.numerator");
+            denominator = builder_.CreateMul(leftDenominator, rightNumerator, "rational.divide.denominator");
+        } else {
+            error(location, "FeatureError", "Unsupported native Rational arithmetic operation '" + op + "'");
+            return nullptr;
+        }
+
+        return emitRationalNormalize(numerator, denominator, location);
+    }
+
+    llvm::Function* rationalMultiplyFunction() {
+        if (rationalMultiply_) 
+            return rationalMultiply_;
+        
+        auto* rationalType = rationalLLVMType();
+        auto* integerType = llvm::IntegerType::get(context_, 128);
+        auto* functionType = llvm::FunctionType::get(rationalType, {rationalType, rationalType}, false);
+        rationalMultiply_ = llvm::Function::Create(functionType, llvm::Function::InternalLinkage, "cmath.rational.multiply", module_.get());
+        auto argument = rationalMultiply_->arg_begin();
+
+        llvm::Value* left = &*argument++;
+        llvm::Value* right = &*argument;
+
+        auto* entry = llvm::BasicBlock::Create(context_, "entry", rationalMultiply_);
+        auto* failure = llvm::BasicBlock::Create(context_, "overflow", rationalMultiply_);
+        auto* success = llvm::BasicBlock::Create(context_, "success", rationalMultiply_);
+
+        llvm::IRBuilder<> helperBuilder(context_);
+        helperBuilder.SetInsertPoint(entry);
+
+        auto* aNumerator = helperBuilder.CreateSExt(helperBuilder.CreateExtractValue(left, {0}), integerType);
+        auto* aDenominator = helperBuilder.CreateSExt(helperBuilder.CreateExtractValue(left, {1}), integerType);
+        auto* bNumerator = helperBuilder.CreateSExt(helperBuilder.CreateExtractValue(right, {0}), integerType);
+        auto* bDenominator = helperBuilder.CreateSExt(helperBuilder.CreateExtractValue(right, {1}), integerType);
+
+        auto* zero = llvm::ConstantInt::get(integerType, 0);
+        auto* aNegative = helperBuilder.CreateICmpSLT(aNumerator, zero);
+        auto* bNegative = helperBuilder.CreateICmpSLT(bNumerator, zero);
+        auto* absANumerator = helperBuilder.CreateSelect(aNegative, helperBuilder.CreateNeg(aNumerator), aNumerator);
+        auto* absBNumerator = helperBuilder.CreateSelect(bNegative, helperBuilder.CreateNeg(bNumerator), bNumerator);
+
+        auto* gcd1 = helperBuilder.CreateCall(rationalGcdFunction(), {absANumerator, bDenominator}, "rational.multiply.gcdi");
+        auto* gcd2 = helperBuilder.CreateCall(rationalGcdFunction(), {absBNumerator, aDenominator}, "rational.multiply.gcd2");
+    
+        auto divideExact = [&](llvm::Value* dividend, llvm::Value* divisor) -> llvm::Value* {
+            auto* division = helperBuilder.CreateCall(rationalDivModFunction(), {dividend, divisor});
+            return helperBuilder.CreateExtractValue(division, {0});
+        };
+
+        auto* reducedANumerator = divideExact(absANumerator, gcd1);
+        auto* reducedBDenominator = divideExact(bDenominator, gcd1);
+
+        auto* reducedBNumerator = divideExact(absBNumerator, gcd2);
+        auto* reducedADenominator = divideExact(aDenominator, gcd2);
+        auto* numeratorMagnitude = helperBuilder.CreateMul(reducedANumerator, reducedBNumerator, "rational.multiply.numerator");
+
+        auto* denominator = helperBuilder.CreateMul(reducedADenominator, reducedBDenominator, "rational.multiply.denominator");
+        auto* negative = helperBuilder.CreateXor(aNegative, bNegative);
+
+        auto* numerator = helperBuilder.CreateSelect(negative, helperBuilder.CreateNeg(numeratorMagnitude), numeratorMagnitude);
+
+        const auto minimum = llvm::ConstantInt::getSigned(integerType, std::numeric_limits<std::int64_t>::min());
+        const auto maximum = llvm::ConstantInt::getSigned(integerType, std::numeric_limits<std::int64_t>::max());
+
+        auto* numeratorTooSmall = helperBuilder.CreateICmpSLT(numerator, minimum);
+        auto* numeratorTooLarge = helperBuilder.CreateICmpSGT(numerator, maximum);
+
+        auto* denominatorTooLarge = helperBuilder.CreateICmpUGT(denominator, maximum);
+        auto* invalid = helperBuilder.CreateOr(numeratorTooSmall, helperBuilder.CreateOr(numeratorTooLarge, denominatorTooLarge));
+        helperBuilder.CreateCondBr(invalid, failure, success);
+        helperBuilder.SetInsertPoint(failure);
+        helperBuilder.CreateCall(printf_,
+        {
+            helperBuilder.CreateGlobalString(
+                "CMath runtime error: Rational multiplication overflow\n"
+            )
+        });
+
+        helperBuilder.CreateCall(fflush_, {llvm::ConstantPointerNull::get(helperBuilder.getPtrTy())});
+
+        helperBuilder.CreateCall(abort_);
+        helperBuilder.CreateUnreachable();
+
+        helperBuilder.SetInsertPoint(success);
+        auto* numerator64 = helperBuilder.CreateTrunc(numerator, helperBuilder.getInt64Ty());
+        auto* denominator64 = helperBuilder.CreateTrunc(denominator, helperBuilder.getInt64Ty());
+
+        auto* undefResult = llvm::UndefValue::get(rationalType);
+        auto* result = helperBuilder.CreateInsertValue(undefResult, numerator64, {0});
+        result = helperBuilder.CreateInsertValue(result, denominator64, {1});
+        helperBuilder.CreateRet(result);
+        return rationalMultiply_;
+    }
+
+    llvm::Function* rationalPowerFunction() {
+        if (rationalPower_) 
+            return rationalPower_;
+
+        auto* multiplyFunction = rationalMultiplyFunction();
+
+        auto* rationalType = rationalLLVMType();
+        auto* integerType = builder_.getInt64Ty();
+
+        auto* functionType = llvm::FunctionType::get(rationalType, {rationalType, integerType}, false);
+        rationalPower_ = llvm::Function::Create(functionType, llvm::Function::InternalLinkage, "cmath.rational.power", module_.get());
+
+        auto argument = rationalPower_->arg_begin();
+
+        llvm::Value* initialBase = &*argument++;
+        llvm::Value* initialExponent = &*argument;
+
+        auto* entry = llvm::BasicBlock::Create(context_, "entry", rationalPower_);
+        auto* failure = llvm::BasicBlock::Create(context_, "invalid", rationalPower_);
+        auto* prepare = llvm::BasicBlock::Create(context_, "prepare", rationalPower_);
+        auto* loop = llvm::BasicBlock::Create(context_, "loop", rationalPower_);
+        auto* body = llvm::BasicBlock::Create(context_, "body", rationalPower_);
+        auto* multiply = llvm::BasicBlock::Create(context_, "multiply", rationalPower_);
+        auto* skipMultiply = llvm::BasicBlock::Create(context_, "skip.multiply", rationalPower_);
+        auto* afterMultiply = llvm::BasicBlock::Create(context_, "after.multiply", rationalPower_);
+        auto* square = llvm::BasicBlock::Create(context_, "square", rationalPower_);
+        auto* skipSquare = llvm::BasicBlock::Create(context_, "skip.square", rationalPower_);
+        auto* iterationEnd = llvm::BasicBlock::Create(context_, "iteration.end", rationalPower_);
+        auto* exit = llvm::BasicBlock::Create(context_, "exit", rationalPower_);
+        
+        llvm::IRBuilder<> helperBuilder(context_);
+
+        auto* zero = helperBuilder.getInt64(0);
+        auto* one = helperBuilder.getInt64(1);
+
+        helperBuilder.SetInsertPoint(entry);
+
+        auto* numerator = helperBuilder.CreateExtractValue(initialBase, {0});
+        auto* denominator = helperBuilder.CreateExtractValue(initialBase, {1});
+
+        auto* negativeExponent = helperBuilder.CreateICmpSLT(initialExponent, zero);
+        auto* zeroBase = helperBuilder.CreateICmpEQ(numerator, zero);
+
+        auto* minimumNumerator = llvm::ConstantInt::getSigned(helperBuilder.getInt64Ty(), std::numeric_limits<std::int64_t>::min());
+        auto* cannotInvert = helperBuilder.CreateICmpEQ(numerator, minimumNumerator);
+
+        auto* invalidZeroPower = helperBuilder.CreateAnd(negativeExponent, zeroBase);
+        auto* invalidReciprocal = helperBuilder.CreateAnd(negativeExponent, cannotInvert);
+
+        auto* invalid = helperBuilder.CreateOr(invalidZeroPower, invalidReciprocal);
+        helperBuilder.CreateCondBr(invalid, failure, prepare);
+
+        helperBuilder.SetInsertPoint(failure);
+        helperBuilder.CreateCall(
+            printf_,
+            {
+                helperBuilder.CreateGlobalString("CMath runtime error: Invalid or overflowing negative Rational power\n")
+            }
+        );
+
+        helperBuilder.CreateCall(fflush_, {llvm::ConstantPointerNull::get(helperBuilder.getPtrTy())});
+
+        helperBuilder.CreateCall(abort_);
+        helperBuilder.CreateUnreachable();
+
+        helperBuilder.SetInsertPoint(prepare);
+        auto* numeratorNegative = helperBuilder.CreateICmpSLT(numerator, zero);
+        auto* absoluteNumerator = helperBuilder.CreateSelect(numeratorNegative, helperBuilder.CreateNeg(numerator), numerator);
+        auto* reciprocalNumerator = helperBuilder.CreateSelect(numeratorNegative, helperBuilder.CreateNeg(denominator), denominator);
+        auto* baseNumerator = helperBuilder.CreateSelect(negativeExponent, reciprocalNumerator, numerator);
+        auto* baseDenominator = helperBuilder.CreateSelect(negativeExponent, absoluteNumerator, denominator);
+        auto* undefBase = llvm::UndefValue::get(rationalType);
+        auto* base = helperBuilder.CreateInsertValue(undefBase, baseNumerator, {0});
+        base = helperBuilder.CreateInsertValue(base, baseDenominator, {1});
+
+        auto* negatedExponent = helperBuilder.CreateNeg(initialExponent);
+        auto* exponentMagnitude = helperBuilder.CreateSelect(negativeExponent, negatedExponent, initialExponent);
+        auto* oneRational = llvm::ConstantStruct::get(rationalType, {helperBuilder.getInt64(1), helperBuilder.getInt64(1)});
+
+        helperBuilder.CreateBr(loop);
+        helperBuilder.SetInsertPoint(loop);
+
+        auto* basePhi = helperBuilder.CreatePHI(rationalType, 2, "power.base");
+        auto* resultPhi = helperBuilder.CreatePHI(rationalType, 2, "power.result");
+        auto* exponentPhi = helperBuilder.CreatePHI(integerType, 2, "power.exponent");
+
+        basePhi->addIncoming(base, prepare);
+        resultPhi->addIncoming(oneRational, prepare);
+        exponentPhi->addIncoming(exponentMagnitude, prepare);
+
+        auto* finished = helperBuilder.CreateICmpEQ(exponentPhi, zero);
+        helperBuilder.CreateCondBr(finished, exit, body);
+
+        helperBuilder.SetInsertPoint(body);
+
+        auto* exponentIsOdd = helperBuilder.CreateICmpNE(helperBuilder.CreateAnd(exponentPhi, one), zero);
+
+        helperBuilder.CreateCondBr(exponentIsOdd, multiply, skipMultiply);
+        helperBuilder.SetInsertPoint(multiply);
+
+        auto* product = helperBuilder.CreateCall(multiplyFunction, {resultPhi, basePhi}, "power.product");
+        helperBuilder.CreateBr(afterMultiply);
+        helperBuilder.SetInsertPoint(skipMultiply);
+        helperBuilder.CreateBr(afterMultiply);
+        helperBuilder.SetInsertPoint(afterMultiply);
+
+        auto* nextResult = helperBuilder.CreatePHI(rationalType, 2, "power.next.result");
+        nextResult->addIncoming(product, multiply);
+        nextResult->addIncoming(resultPhi, skipMultiply);
+        
+        auto* nextExponent = helperBuilder.CreateLShr(exponentPhi, one);
+        auto* needsSquare = helperBuilder.CreateICmpNE(nextExponent, zero);
+        helperBuilder.CreateCondBr(needsSquare, square, skipSquare);
+
+        helperBuilder.SetInsertPoint(square);
+        auto* squared = helperBuilder.CreateCall(multiplyFunction, {basePhi, basePhi}, "power.square");
+
+        helperBuilder.CreateBr(iterationEnd);
+        helperBuilder.SetInsertPoint(skipSquare);
+        helperBuilder.CreateBr(iterationEnd);
+        helperBuilder.SetInsertPoint(iterationEnd);
+
+        auto* nextBase = helperBuilder.CreatePHI(rationalType, 2, "power.next.base");
+        nextBase->addIncoming(squared, square);
+        nextBase->addIncoming(basePhi, skipSquare);
+
+        helperBuilder.CreateBr(loop);
+
+        basePhi->addIncoming(nextBase, iterationEnd);
+        resultPhi->addIncoming(nextResult, iterationEnd);
+        exponentPhi->addIncoming(nextExponent, iterationEnd);
+
+        helperBuilder.SetInsertPoint(exit);
+        helperBuilder.CreateRet(resultPhi);
+
+        return rationalPower_;
+    }
+
     void emitZeroCheck(
         llvm::Value* value,
         bool isReal,
@@ -1293,11 +1932,10 @@ private:
             std::to_string(location.line) + ":" +
             std::to_string(location.column) +
             ": " + message + "\n";
+        
+        builder_.CreateCall(printf_, {makeString(diagnostic, "cmath.runtime.message")});
 
-        builder_.CreateCall(
-            printf_,
-            {makeString(diagnostic, "cmath.runtime.message")}
-        );
+        builder_.CreateCall(fflush_, {llvm::ConstantPointerNull::get(builder_.getPtrTy())});
 
         builder_.CreateCall(abort_);
         builder_.CreateUnreachable();
@@ -1605,6 +2243,38 @@ private:
                         value
                     }
                 );
+            } else if (argumentExpr->type == ValueType::Rational) {
+                auto* value = emitExpression(argumentExpr);
+
+                if (!value) return nullptr;
+
+                auto* numerator = builder_.CreateExtractValue(value, {0}, "rational.print.numerator");
+                auto* denominator = builder_.CreateExtractValue(value, {1}, "rational.print.denominator");
+
+                auto* function = builder_.GetInsertBlock()->getParent();
+                auto* integerBlock = llvm::BasicBlock::Create(context_, "rational.print.integer", function);
+                auto* fractionBlock = llvm::BasicBlock::Create(context_, "rational.print.fraction", function);
+                auto* mergeBlock = llvm::BasicBlock::Create(context_, "rational.print.end", function);
+
+                auto* isInteger = builder_.CreateICmpEQ(denominator, builder_.getInt64(1));
+                builder_.CreateCondBr(isInteger, integerBlock, fractionBlock);
+                builder_.SetInsertPoint(integerBlock);
+                builder_.CreateCall(printf_, {
+                    makeString("%lld", "cmath.fmt.rational.integer"),
+                    numerator
+                });
+                
+                builder_.CreateBr(mergeBlock);
+                builder_.SetInsertPoint(fractionBlock);
+                builder_.CreateCall(printf_, 
+                    {
+                        makeString("%lld/%lld", "cmath.fmt.rational.fraction"),
+                        numerator,
+                        denominator
+                    });
+                
+                builder_.CreateBr(mergeBlock);
+                builder_.SetInsertPoint(mergeBlock);
             } else if (argumentExpr->type == ValueType::Real) {
                 auto* value = emitExpression(argumentExpr);
 
@@ -1677,6 +2347,10 @@ private:
         builder_.CreateCall(
             printf_,
             {makeString("\n", "cmath.print.newline")}
+        );
+        builder_.CreateCall(
+            fflush_,
+            {llvm::ConstantPointerNull::get(builder_.getPtrTy())}
         );
 
         return llvm::ConstantInt::get(
@@ -2092,8 +2766,17 @@ private:
 
     llvm::FunctionCallee printf_;
     llvm::FunctionCallee abort_;
+    llvm::FunctionCallee fflush_;
     llvm::FunctionCallee strcmp_;
     llvm::FunctionCallee pow_;
+
+    llvm::StructType* rationalType_ = nullptr;
+    llvm::StructType* rationalDivModType_ = nullptr;
+    llvm::Function* rationalGcd_ = nullptr;
+    llvm::Function* rationalDivMod_ = nullptr;
+
+    llvm::Function* rationalMultiply_ = nullptr;
+    llvm::Function* rationalPower_ = nullptr;
 
     std::unordered_map<std::string, llvm::FunctionCallee>
         mathFunctions_;

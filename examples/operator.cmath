@@ -1,0 +1,165 @@
+domain Integer
+
+# ============================================================
+# CMath 0.3.0 operator regression test
+#
+# Covers:
+#   - Unary plus and minus
+#   - Integer and Real arithmetic
+#   - Integer exponentiation (zero and positive exponents)
+#   - Prefix/postfix increment and decrement
+#   - All six compound assignments for Integer
+#   - Supported Real compound assignments (+, -, *, /, ^)
+#   - Integer-to-Real widening, including increment expressions
+#
+# Note: '%' is Integer-only, and '^' requires an Integer exponent.
+#
+# Negative Integer exponents are intentionally excluded from native run:
+# the interpreter represents those results as Rational, which is not yet
+# supported by the native backend.
+# ============================================================
+
+print("=== Unary and binary arithmetic ===")
+print(+5)
+print(-5)
+print(12 + 7)
+print(12 - 7)
+print(6 * 7)
+print(20.0 / 4.0)
+print(17 % 5)
+
+print("=== Integer exponentiation ===")
+print(2 ^ 0)
+print(2 ^ 1)
+print(2 ^ 10)
+print((-2) ^ 3)
+print((-2) ^ 4)
+print(3 ^ 5)
+
+print("=== Integer prefix and postfix increment/decrement ===")
+var integer_counter: Integer = 5
+print(integer_counter++)
+print(integer_counter)
+print(++integer_counter)
+print(integer_counter)
+print(integer_counter--)
+print(integer_counter)
+print(--integer_counter)
+print(integer_counter)
+
+print("=== Real prefix and postfix increment/decrement ===")
+var real_counter: Real = 1.5
+print(real_counter++)
+print(real_counter)
+print(++real_counter)
+print(real_counter)
+print(real_counter--)
+print(real_counter)
+print(--real_counter)
+print(real_counter)
+
+print("=== Integer compound assignments ===")
+var integer_compound: Integer = 5
+integer_compound += 5
+print(integer_compound)
+integer_compound -= 2
+print(integer_compound)
+integer_compound *= 3
+print(integer_compound)
+integer_compound %= 10
+print(integer_compound)
+integer_compound ^= 2
+print(integer_compound)
+
+print("=== Real compound assignments ===")
+var real_compound: Real = 20.0
+real_compound += 4.0
+print(real_compound)
+real_compound -= 4.0
+print(real_compound)
+real_compound *= 2.0
+print(real_compound)
+real_compound /= 5.0
+print(real_compound)
+real_compound ^= 3
+print(real_compound)
+
+print("=== Integer-to-Real widening ===")
+var integer_source: Integer = 4
+var widened_value: Real = 0.0
+widened_value = integer_source
+print(widened_value)
+widened_value = ++integer_source
+print(widened_value)
+print(integer_source)
+widened_value = integer_source++
+print(widened_value)
+print(integer_source)
+
+print("=== Integer and Real mixed arithmetic ===")
+var mixed_integer: Integer = 7
+var mixed_real: Real = 2.5
+print(mixed_integer + mixed_real)
+print(mixed_integer - mixed_real)
+print(mixed_integer * mixed_real)
+print(mixed_integer / mixed_real)
+
+# ============================================================
+# Expected stdout
+# ============================================================
+# === Unary and binary arithmetic ===
+# 5
+# -5
+# 19
+# 5
+# 42
+# 5
+# 2
+# === Integer exponentiation ===
+# 1
+# 2
+# 1024
+# -8
+# 16
+# 243
+# === Integer prefix and postfix increment/decrement ===
+# 5
+# 6
+# 7
+# 7
+# 7
+# 6
+# 5
+# 5
+# === Real prefix and postfix increment/decrement ===
+# 1.5
+# 2.5
+# 3.5
+# 3.5
+# 3.5
+# 2.5
+# 1.5
+# 1.5
+# === Integer compound assignments ===
+# 10
+# 8
+# 24
+# 4
+# 16
+# === Real compound assignments ===
+# 24
+# 20
+# 40
+# 8
+# 512
+# === Integer-to-Real widening ===
+# 4
+# 5
+# 5
+# 5
+# 6
+# === Integer and Real mixed arithmetic ===
+# 9.5
+# 4.5
+# 17.5
+# 2.8

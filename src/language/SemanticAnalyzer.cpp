@@ -303,15 +303,23 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
                         error(expression->location, "TypeError", "Operator '%' is defined only for Integer operands");
                     else result = ValueType::Integer;
                 } else if (op == "^") {
-                    if (right->type != ValueType::Integer) {
-                        error(expression->location, "TypeError", "The exponent must have type Integer");
-                    } else if (left->type == ValueType::Integer) {
-                        const auto knownExponent = constantReal(expression->children[1]);
-                        result = knownExponent && *knownExponent >= 0 &&
-                                 std::floor(*knownExponent) == *knownExponent
-                            ? ValueType::Integer : ValueType::Rational;
+                    if (right->type == ValueType::Complex) {
+                        error(expression->location, "TypeError", "Complex exponents are not supported yet");
+                    } else if (left->type == ValueType::Complex) {
+                        if (right->type != ValueType::Integer) {
+                            error(expression->location, "TypeError", "Complex bases currently support only Integer exponents");
+                        } else {
+                            result = ValueType::Complex;
+                        }
+                    } else if (right->type == ValueType::Integer) {
+                        if (left->type == ValueType::Integer) {
+                            const auto knownExponent = constantReal(expression->children[1]);
+                            result = knownExponent && *knownExponent >= 0.0L && std::floor(*knownExponent) == *knownExponent ? ValueType::Integer : ValueType::Rational;
+                        } else {
+                            result = left->type;
+                        }
                     } else {
-                        result = left->type;
+                        result = ValueType::Real;
                     }
                 } else {
                     result = promotedNumeric(left->type, right->type);

@@ -1,0 +1,28 @@
+domain Integer
+
+print("=== Rational literals and printing ===")
+print(1.5)
+print(2.25)
+print(5.0)
+print(-3.5)
+
+print("=== Exact Rational arithmetic ===")
+print(20.0 / 4.0)
+print(1.0 / 3.0)
+print(1.5 + 2.25)
+print(1.5 - 2.25)
+print(1.5 * 2.25)
+
+print("=== Mixed Integer and Rational ===")
+print(1 + 0.5)
+print(3 - 0.25)
+print(2 * 1.5)
+
+print("=== Rational variables ===")
+var x: Rational = 1.0 / 3.0
+x += 1.0 / 6.0
+print(x)
+
+print("=== Exact comparisons ===")
+print(1.0 / 3.0 == 2.0 / 6.0)
+print(1.0 / 3.0 < 1.0 / 2.0)

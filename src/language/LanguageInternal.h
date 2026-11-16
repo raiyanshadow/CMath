@@ -340,9 +340,10 @@ namespace cmath::language::detail {
     };
 
     struct RationalValue {
-        std::int64_t numerator = 0;
-        std::int64_t denominator = 1;
+        std::int64_t numerator;
+        std::int64_t denominator;
     };
+    
     using RuntimeData = std::variant<std::int64_t, RationalValue, double,
                                     std::complex<double>, bool, std::string,
                                     std::monostate>;

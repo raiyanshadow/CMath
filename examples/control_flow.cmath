@@ -2,11 +2,6 @@ domain Integer
 
 # ============================================================
 # CMath 0.3.0 native regression test
-#
-# Run from the CMath project root:
-#   .\build-vs2026\Release\mathmake.exe check .\native_control_flow_regression.cmath
-#   .\build-vs2026\Release\mathmake.exe run   .\native_control_flow_regression.cmath
-#
 # Covers Boolean logic, short-circuit evaluation, unary not,
 # if/elif/else, nested conditionals, functions and returns,
 # recursion, Integer-to-Real conversion, increment/decrement,

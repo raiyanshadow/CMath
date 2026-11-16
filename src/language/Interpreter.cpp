@@ -574,7 +574,7 @@ namespace cmath::language::detail {
             throw RuntimeFault(location, "MemoryError", "Integer arithmetic overflows supported 64-bit range");
         }
 
-        if (op == "^") {
+        if (op == "^" && rightValue.type == ValueType::Integer) {
             const auto exponentValue = std::get<std::int64_t>(rightValue.data);
             if (resultType == ValueType::Rational) {
                 RationalValue base;
@@ -620,6 +620,70 @@ namespace cmath::language::detail {
                 if (exponentValue < 0) result = std::complex<double>(1, 0) / result;
                 return {ValueType::Complex, result};
             }
+        }
+
+        if (op == "^" && rightValue.type == ValueType::Rational) {
+            if (leftValue.type == ValueType::Complex) {
+                throw RuntimeFault(location, "FeatureError", "Non-integer powers of Complex bases are not yet supported");
+            }
+            const auto exponent = std::get<RationalValue>(rightValue.data);
+            const double base = static_cast<double>(numericAsLongDouble(leftValue));
+            const double power = static_cast<double>(exponent.numerator) / static_cast<double>(exponent.denominator);
+
+            if (base == 0.0 && exponent.numerator < 0) {
+                throw RuntimeFault(location, "DomainError", "Zero cannot be raised to a negative power");
+            }
+
+            double result = 0.0;
+            if (base < 0.0) {
+                if ((exponent.denominator % 2) == 0) {
+                    throw RuntimeFault(location, "DomainError", "A negative base with an even-denominator Rational exponent has no Real result");
+                }
+            }
+            result = std::pow(-base, power);
+            if ((exponent.numerator % 2) != 0) {
+                result = -result;
+            } else {
+                result = std::pow(base, power);
+            }
+
+            if (std::isnan(result)) {
+                throw RuntimeFault(location, "DomainError", "Rational exponentiation is outside the Real domain");
+            }
+
+            if (!std::isfinite(result)) {
+                throw RuntimeFault(location, "OverflowError", "Rational exponentiation provided a non-finite result");
+            }
+            return {ValueType::Real, result};
+        }
+
+        if (op == "^" && rightValue.type == ValueType::Real) {
+            if (leftValue.type == ValueType::Complex) {
+                throw RuntimeFault(location, "FeatureError", "Non-integer powers of Complex bases are not yet supported");
+            }
+
+            const double base = static_cast<double>(numericAsLongDouble(leftValue));
+            const double exponent = std::get<double>(rightValue.data);
+
+            if (base == 0.0 && exponent < 0.0) {
+                throw RuntimeFault(location, "DomainError", "Zero cannot be raised to a negative power");
+            }
+
+            const double result = std::pow(base, exponent);
+
+            if (std::isnan(result)) {
+                throw RuntimeFault(location, "DomainError", "Real exponentiation is outside the Real domain");
+            }
+
+            if (!std::isfinite(result)) {
+                throw RuntimeFault(location, "OverflowError", "Real exponentatiation produced a non-finite result");
+            }
+
+            return {ValueType::Real, result};
+        }
+
+        if (op == "^" && rightValue.type == ValueType::Complex) {
+            throw RuntimeFault(location, "FeatureError", "Complex exponents are not yet supported");
         }
 
         if (resultType == ValueType::Rational) {
