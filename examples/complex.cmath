@@ -1,0 +1,36 @@
+domain Complex
+
+def combine(a: Complex, b: Complex) -> Complex:
+    return a + b
+
+let a: Complex = 2 + 3 * Complex.i
+let b: Complex = 4 - 2 * Complex.i
+
+print("=== Complex constants ===")
+print(Complex.i)
+print(Complex.Imaginary)
+
+print("=== Complex arithmetic ===")
+print(a)
+print(b)
+print(a + b)
+print(a - b)
+print(a * b)
+print(a / b)
+
+print("=== Unary operations ===")
+print(-a)
+
+print("=== Numeric promotion ===")
+print(2 + Complex.i)
+print(2.5 + Complex.i)
+print(5 + 2 * Complex.i)
+
+print("=== Comparisons ===")
+print(a == a)
+print(a == b)
+print(a != b)
+print(Complex.i == Complex.Imaginary)
+
+print("=== Functions ===")
+print(combine(a, b))

@@ -222,6 +222,20 @@ private:
         return builder_.CreateInsertValue(result, denominator, {1}, "rational.denominator");
     }
 
+    llvm::StructType* complexLLVMType() {
+        if (!complexType_) {
+            complexType_ = llvm::StructType::create(context_, "cmath.Complex");
+            complexType_->setBody({builder_.getDoubleTy(), builder_.getDoubleTy()}, false);
+        }
+        return complexType_;
+    }
+
+    llvm::Value* createComplex(llvm::Value* real, llvm::Value* imaginary) {
+        auto* undefResult = llvm::UndefValue::get(complexLLVMType());
+        auto* result = builder_.CreateInsertValue(undefResult, real, {0}, "complex.real");
+        return builder_.CreateInsertValue(result, imaginary, {1}, "complex.imaginary");
+    }
+
     llvm::Function* rationalDivModFunction() {
         if (rationalDivMod_)
             return rationalDivMod_;
@@ -416,12 +430,7 @@ private:
                 return rationalLLVMType();
 
             case ValueType::Complex:
-                error(
-                    {},
-                    "FeatureError",
-                    "Native code generation does not yet support Complex values"
-                );
-                return nullptr;
+                return complexLLVMType();
 
             case ValueType::Error:
                 error(
@@ -675,6 +684,28 @@ private:
             return builder_.CreateFDiv(numeratorReal, denominatorReal, "rational.to.real");
         }
 
+        if (to == ValueType::Complex) {
+            llvm::Value* realPart = nullptr;
+
+            if (from == ValueType::Integer) {
+                realPart = builder_.CreateSIToFP(value, builder_.getDoubleTy(), "integer.to.complex");
+            } else if (from == ValueType::Rational) {
+                auto* numerator = builder_.CreateExtractValue(value, {0});
+                auto* denominator = builder_.CreateExtractValue(value, {1});
+
+                auto* numeratorReal = builder_.CreateSIToFP(numerator, builder_.getDoubleTy());
+                auto* denominatorReal = builder_.CreateSIToFP(denominator, builder_.getDoubleTy());
+                realPart = builder_.CreateFDiv(numeratorReal, denominatorReal, "rational.to.complex");
+            } else if (from == ValueType::Real) {
+                realPart = value;
+            }
+
+            if (realPart) {
+                auto* imaginaryPart = llvm::ConstantFP::get(builder_.getDoubleTy(), 0.0);
+                return createComplex(realPart, imaginaryPart);
+            }
+        }
+
         error(
             location,
             "CompileError",
@@ -775,10 +806,8 @@ private:
                         if (!std::isfinite(value))
                             throw std::out_of_range("non-finite");
 
-                        return llvm::ConstantFP::get(
-                            builder_.getDoubleTy(),
-                            value
-                        );
+                        auto* constant = llvm::ConstantFP::get(builder_.getDoubleTy(), value);
+                        return coerce(constant, ValueType::Real, effectiveType, expression->location);
                     } catch (...) {
                         error(
                             expression->location,
@@ -815,17 +844,14 @@ private:
 
             case IRExpression::Kind::Variable: {
                 if (expression->text == "pi") {
-                    return llvm::ConstantFP::get(
-                        builder_.getDoubleTy(),
-                        3.14159265358979323846
-                    );
+                    return coerce(llvm::ConstantFP::get(builder_.getDoubleTy(), 3.14159265358979323846), ValueType::Real, effectiveType, expression->location);
                 }
 
                 if (expression->text == "e") {
-                    return llvm::ConstantFP::get(
+                    return coerce(llvm::ConstantFP::get(
                         builder_.getDoubleTy(),
                         2.71828182845904523536
-                    );
+                    ), ValueType::Real, effectiveType, expression->location);
                 }
 
                 const auto found = variables_.find(
@@ -869,13 +895,7 @@ private:
             }
 
             case IRExpression::Kind::ComplexImaginary:
-                error(
-                    expression->location,
-                    "FeatureError",
-                    "Complex constants are not supported by the initial native backend"
-                );
-
-                return nullptr;
+                return createComplex(llvm::ConstantFP::get(builder_.getDoubleTy(), 0.0), llvm::ConstantFP::get(builder_.getDoubleTy(), 1.0));
 
             case IRExpression::Kind::Increment: {
                 if (expression->children.empty() ||
@@ -935,7 +955,21 @@ private:
 
                 const auto& operandExpression = expression->children.front();
 
-                auto* operand = effectiveType == ValueType::Real ? emitRealExpression(operandExpression) : emitExpression(operandExpression);
+                if (expected == ValueType::Complex && expression->type != ValueType::Complex && expression->type != ValueType::Error) {
+                    auto* value = emitExpression(expression);
+                    return coerce(value, expression->type, ValueType::Complex, expression->location);
+                }
+
+                llvm::Value* operand = nullptr;
+
+                if (effectiveType == ValueType::Real) {
+                    operand = emitRealExpression(operandExpression);
+                } else if (effectiveType == ValueType::Complex) {
+                    operand = emitExpression(operandExpression, ValueType::Complex);
+                } else {
+                    operand = emitExpression(operandExpression);
+                }
+
                 const auto operandType = operandExpression->type;
 
                 if (!operand)
@@ -954,6 +988,12 @@ private:
                     return operand;
 
                 if (expression->text == "-") {
+                    if (effectiveType == ValueType::Complex) {
+                        auto* realPart = builder_.CreateExtractValue(operand, {0}, "complex.negate.real");
+                        auto* imaginaryPart = builder_.CreateExtractValue(operand, {1}, "complex.negate.imaginary");
+                        return createComplex(builder_.CreateFNeg(realPart, "complex.negate.real.result"), builder_.CreateFNeg(imaginaryPart, "complex.negate.imaginary.result"));
+                    }
+
                     if (effectiveType == ValueType::Real) {
                         return builder_.CreateFNeg(
                             operand,
@@ -990,8 +1030,13 @@ private:
                 return nullptr;
             }
 
-            case IRExpression::Kind::Binary:
+            case IRExpression::Kind::Binary: {
+                if (expected == ValueType::Complex && expression->type != ValueType::Complex && expression->type != ValueType::Error) {
+                    auto* value = emitBinary(expression, ValueType::Error);
+                    return coerce(value, expression->type, ValueType::Complex, expression->location);
+                }
                 return emitBinary(expression, expected);
+            }
 
             case IRExpression::Kind::Call: {
                 auto* value = emitCall(expression);
@@ -1173,13 +1218,32 @@ private:
                 leftType == ValueType::Complex ||
                 rightType == ValueType::Complex
             ) {
-                error(
-                    expression->location,
-                    "FeatureError",
-                    "Complex comparisons are not yet supported by the native backend"
-                );
+                if (op != "==" && op != "!=") {
+                    error(expression->location, "DomainError", "Complex numbers support equality comparisons only");
+                    return nullptr;
+                }
+                auto* left = emitExpression(leftExpr, ValueType::Complex);
+                auto* right = emitExpression(rightExpr, ValueType::Complex);
 
-                return nullptr;
+                if (!left || !right) return nullptr;
+
+                auto* leftReal = builder_.CreateExtractValue(left, {0});
+                auto* leftImaginary = builder_.CreateExtractValue(left, {1});
+
+                auto* rightReal = builder_.CreateExtractValue(right, {0});
+                auto* rightImaginary = builder_.CreateExtractValue(right, {1});
+
+                auto* realEqual = builder_.CreateFCmpOEQ(leftReal, rightReal);
+                auto* imaginaryEqual = builder_.CreateFCmpOEQ(leftImaginary, rightImaginary);
+
+                if (op == "==") {
+                    return builder_.CreateAnd(realEqual, imaginaryEqual, "complex.equal");
+                }
+
+                auto* realNotEqual = builder_.CreateFCmpUNE(leftReal, rightReal);
+                auto* imaginaryNotEqual = builder_.CreateFCmpUNE(leftImaginary, rightImaginary);
+
+                return builder_.CreateOr(realNotEqual, imaginaryNotEqual, "complex.not.equal");
             }
 
             const bool useReal =
@@ -1274,6 +1338,95 @@ private:
              expression->type == ValueType::Real)
         ) {
             effectiveType = ValueType::Real;
+        }
+
+        if (expression->type == ValueType::Complex) {
+            if (op == "^") {
+                error(expression->location, "FeatureError", "Complex exponentiation is not yet supported by the native backend");
+                return nullptr;
+            }
+
+            auto* left = emitExpression(leftExpr, ValueType::Complex);
+            auto* right = emitExpression(rightExpr, ValueType::Complex);
+            if (!left || !right) return nullptr;
+
+            auto* a = builder_.CreateExtractValue(left, {0}, "complex.left.real");
+            auto* b = builder_.CreateExtractValue(left, {1}, "complex.left.imaginary");
+
+            auto* c = builder_.CreateExtractValue(right, {0}, "complex.right.real");
+            auto* d = builder_.CreateExtractValue(right, {1}, "complex.right.imaginary");
+
+            if (op == "+") {
+                return createComplex(builder_.CreateFAdd(a, c, "complex.add.real"), builder_.CreateFAdd(b, d, "complex.add.imaginary"));
+            }
+
+            if (op == "-") {
+                return createComplex(builder_.CreateFSub(a, c, "complex.subtract.real"), builder_.CreateFSub(b, d, "complex.subtract.imaginary"));
+            }
+
+            if (op == "*") {
+                auto* ac = builder_.CreateFMul(a, c);
+                auto* bd = builder_.CreateFMul(b, d);
+                auto* ad = builder_.CreateFMul(a, d);
+                auto* bc = builder_.CreateFMul(b, c);
+
+                return createComplex(builder_.CreateFSub(ac, bd, "complex.multiply.real"), builder_.CreateFAdd(ad, bc, "complex.multiply.imaginary"));
+            }
+
+            if (op == "/") {
+                auto* zero = llvm::ConstantFP::get(builder_.getDoubleTy(), 0.0);
+
+                auto* cIsZero = builder_.CreateFCmpOEQ(c, zero);
+                auto* dIsZero = builder_.CreateFCmpOEQ(d, zero);
+
+                emitAbortIf(builder_.CreateAnd(cIsZero, dIsZero), expression->location, "Complex division by zero");
+
+                // Smith's algorithm
+                auto* absC = builder_.CreateCall(mathFunctions_.at("fabs"), {c}, "complex.division.abs.real");
+                auto* absD = builder_.CreateCall(mathFunctions_.at("fabs"), {d}, "complex.divide.abs.imaginary");
+
+                auto* realDominant = builder_.CreateFCmpOGE(absC, absD);
+
+                auto* function = builder_.GetInsertBlock()->getParent();
+                auto* realDominantBlock = llvm::BasicBlock::Create(context_, "complex.divide.real.dominant", function);
+                auto* imaginaryDominantBlock = llvm::BasicBlock::Create(context_, "complex.divide.imaginary.dominant", function);
+                auto* mergeBlock = llvm::BasicBlock::Create(context_, "complex.divide.merge", function);
+                builder_.CreateCondBr(realDominant, realDominantBlock, imaginaryDominantBlock);
+
+                builder_.SetInsertPoint(realDominantBlock);
+
+                auto* ratioReal = builder_.CreateFDiv(d, c);
+                auto* denominatorReal = builder_.CreateFAdd(c, builder_.CreateFMul(d, ratioReal));
+                auto* resultRealA = builder_.CreateFDiv(builder_.CreateFAdd(a, builder_.CreateFMul(b, ratioReal)), denominatorReal);
+                auto* resultImaginaryA = builder_.CreateFDiv(builder_.CreateFSub(b, builder_.CreateFMul(a, ratioReal)), denominatorReal);
+                auto* realDominantEnd = builder_.GetInsertBlock();
+
+                builder_.CreateBr(mergeBlock);
+
+                builder_.SetInsertPoint(imaginaryDominantBlock);
+
+                auto* ratioImaginary = builder_.CreateFDiv(c, d);
+                auto* denominatorImaginary = builder_.CreateFAdd(d, builder_.CreateFMul(c, ratioImaginary));
+                auto* resultRealB = builder_.CreateFDiv(builder_.CreateFAdd(builder_.CreateFMul(a, ratioImaginary), b), denominatorImaginary);
+
+                auto* resultImaginaryB = builder_.CreateFDiv(builder_.CreateFSub(builder_.CreateFMul(b, ratioImaginary), a), denominatorImaginary);
+
+                auto* imaginaryDominantEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(mergeBlock);
+                builder_.SetInsertPoint(mergeBlock);
+
+                auto* resultReal = builder_.CreatePHI(builder_.getDoubleTy(), 2, "complex.divide.result.real");
+
+                resultReal->addIncoming(resultRealA, realDominantEnd);
+                resultReal->addIncoming(resultRealB, imaginaryDominantEnd);
+
+                auto* resultImaginary = builder_.CreatePHI(builder_.getDoubleTy(), 2, "complex.divide.result.imaginary");
+
+                resultImaginary->addIncoming(resultImaginaryA, realDominantEnd);
+                resultImaginary->addIncoming(resultImaginaryB, imaginaryDominantEnd);
+
+                return createComplex(resultReal, resultImaginary);
+            }
         }
 
         if (effectiveType == ValueType::Rational) {
@@ -2288,6 +2441,16 @@ private:
                         value
                     }
                 );
+            } else if (argumentExpr->type == ValueType::Complex) {
+                auto* value = emitExpression(argumentExpr);
+                if (!value) return nullptr;
+
+                auto* realPart = builder_.CreateExtractValue(value, {0}, "complex.print.real");
+                auto* imaginaryPart = builder_.CreateExtractValue(value, {1}, "complex.print.imaginary");
+
+                builder_.CreateCall(printf_, {
+                    makeString("%.15g%+.15gi", "cmath.fmt.complex"), realPart, imaginaryPart
+                });
             } else if (argumentExpr->type == ValueType::String) {
                 auto* value = emitExpression(argumentExpr);
 
@@ -2771,6 +2934,7 @@ private:
     llvm::FunctionCallee pow_;
 
     llvm::StructType* rationalType_ = nullptr;
+    llvm::StructType* complexType_ = nullptr;
     llvm::StructType* rationalDivModType_ = nullptr;
     llvm::Function* rationalGcd_ = nullptr;
     llvm::Function* rationalDivMod_ = nullptr;
