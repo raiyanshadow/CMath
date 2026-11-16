@@ -11,7 +11,7 @@ namespace {
 
 void printHelp() {
     std::cout
-        << "CMath mathmake 0.2 (LLVM native backend)\n\n"
+        << "CMath mathmake 0.3 (Additional Programming Features)\n\n"
         << "Usage:\n"
         << "  mathmake <file.cmath> [options]       Build file.cmath into file.exe\n"
         << "  mathmake build <file.cmath> [options] Build a native executable\n"
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
 
     if (first == "--version") {
         std::cout
-            << "CMath mathmake 0.2 (LLVM native backend)\n";
+            << "CMath mathmake 0.3 (Additional programming features)\n";
 
         return 0;
     }

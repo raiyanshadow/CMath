@@ -650,7 +650,7 @@ private:
 
                 const auto& operandExpression = expression->children.front();
 
-                auto* operand = emitExpression(operandExpression, operandExpression->type == ValueType::Rational ? ValueType::Real : ValueType::Error);
+                auto* operand = effectiveType == ValueType::Real ? emitRealExpression(operandExpression) : emitExpression(operandExpression);
                 const auto operandType = operandExpression->type;
 
                 if (!operand)
@@ -771,7 +771,7 @@ private:
 
         auto *rightEndBlock = builder_.GetInsertBlock();
 
-        if (!rightEndBlock || rightEndBlock->getTerminator()) {
+        if (!rightEndBlock || rightEndBlock->getTerminatorOrNull()) {
             error(expression->location, "CompileError", "Logical right operand did not produce a continuing control-flow path");
             return nullptr;
         }
@@ -1686,23 +1686,24 @@ private:
     }
 
     bool currentBlockTerminated() const {
-        auto *block = builder_.GetInsertBlock();
-        return !block || block->getTerminator() != nullptr;
+        auto* block = builder_.GetInsertBlock();
+        return !block || block->getTerminatorOrNull() != nullptr;
     }
 
-    bool emitBlock(const language::detail::IRBlock& block) {
+    bool emitBlock(const language::detail::IRBlock& block, bool scoped = true) {
         auto previousVariables = variables_;
 
         for (const auto & statement : block.statements) {
-            if (currentBlockTerminated())
+            if (currentBlockTerminated()) {
                 break;
+            }
             if (!emitStatement(statement)) {
-                variables_ = std::move(previousVariables);
+                if (scoped) variables_ = std::move(previousVariables);
                 return false;
             }
         }
 
-        variables_ = std::move(previousVariables);
+        if (scoped) variables_ = std::move(previousVariables);
         return diagnostics_.empty();
     }
 
@@ -1785,6 +1786,7 @@ private:
         }
 
         builder_.CreateCondBr(condition, bodyBlock, exitBlock);
+        builder_.SetInsertPoint(bodyBlock);
         loopTargets_.push_back(LoopTargets{exitBlock, conditionBlock});
 
         const bool bodySucceeded = emitBlock(*loop.body);
@@ -1845,6 +1847,7 @@ private:
 
         loopTargets_.push_back(LoopTargets{exitBlock, incrementBlock});
         const bool bodySucceeded = emitBlock(*loop.body);
+        loopTargets_.pop_back();
         if (!bodySucceeded) {
             variables_ = previousVariables;
             return false;
@@ -1980,6 +1983,7 @@ private:
         builder_.SetInsertPoint(entry);
 
         variables_.clear();
+        loopTargets_.clear();
         inMain_ = false;
 
         std::size_t index = 0;
@@ -2045,7 +2049,7 @@ private:
         loopTargets_.clear();
         inMain_ = true;
 
-        if (!emitBlock(program_.body)) return false;
+        if (!emitBlock(program_.body, false)) return false;
 
         if (!currentBlockTerminated()) builder_.CreateRet(builder_.getInt32(0));
 

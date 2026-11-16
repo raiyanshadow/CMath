@@ -1,0 +1,226 @@
+domain Integer
+
+# ============================================================
+# CMath 0.3.0 native regression test
+#
+# Run from the CMath project root:
+#   .\build-vs2026\Release\mathmake.exe check .\native_control_flow_regression.cmath
+#   .\build-vs2026\Release\mathmake.exe run   .\native_control_flow_regression.cmath
+#
+# Covers Boolean logic, short-circuit evaluation, unary not,
+# if/elif/else, nested conditionals, functions and returns,
+# recursion, Integer-to-Real conversion, increment/decrement,
+# compound assignments, while/for loops, break/continue,
+# nested-loop target restoration, and block-local declarations.
+# ============================================================
+
+def and_probe() -> Boolean:
+    print("AND RHS EXECUTED")
+    return true
+
+def or_probe() -> Boolean:
+    print("OR RHS EXECUTED")
+    return true
+
+def classify(value: Integer) -> Integer:
+    if value < 0:
+        return -1
+    elif value == 0:
+        return 0
+    else:
+        return 1
+
+def factorial(value: Integer) -> Integer:
+    if value <= 1:
+        return 1
+    else:
+        return value * factorial(value - 1)
+
+def negate_as_real(value: Integer) -> Real:
+    return -value
+
+
+print("=== Boolean logic and short-circuiting ===")
+
+print(not false)
+print(true and false)
+print(false or true)
+
+if false and and_probe():
+    print("FAIL: false AND should skip its right side")
+else:
+    print("PASS: false AND skipped its right side")
+
+if true or or_probe():
+    print("PASS: true OR skipped its right side")
+else:
+    print("FAIL: true OR should skip its right side")
+
+if true and and_probe():
+    print("PASS: true AND evaluated its right side")
+
+if false or or_probe():
+    print("PASS: false OR evaluated its right side")
+
+
+print("=== Conditionals, functions, and returns ===")
+
+print(classify(-7))
+print(classify(0))
+print(classify(8))
+
+print(factorial(5))
+print(negate_as_real(7))
+
+var branch_result: Integer = 0
+
+if false:
+    branch_result = 100
+elif false:
+    branch_result = 200
+elif not false and true:
+    branch_result = 20
+
+    if false or true:
+        branch_result += 5
+    else:
+        branch_result = 999
+else:
+    branch_result = 300
+
+print(branch_result)
+
+
+print("=== Block-local declarations ===")
+
+if true:
+    let branch_local: Integer = 12
+    print(branch_local)
+
+let branch_local: Integer = 34
+print(branch_local)
+
+
+print("=== Increment, decrement, and compound assignment ===")
+
+var counter: Integer = 3
+
+print(counter++)
+print(++counter)
+print(counter--)
+print(--counter)
+
+var compound: Integer = 10
+
+compound += 5
+compound *= 2
+compound -= 6
+
+print(compound)
+
+
+print("=== While loop, continue, and break ===")
+
+var while_index: Integer = 0
+var while_total: Integer = 0
+
+while while_index < 7:
+    while_index += 1
+
+    if while_index == 2:
+        continue
+
+    if while_index == 6:
+        break
+
+    while_total += while_index
+
+print(while_index)
+print(while_total)
+
+
+print("=== For-loop range, continue, and break ===")
+
+var range_total: Integer = 0
+
+for range_index in 0..5:
+    range_total += range_index
+
+print(range_total)
+
+var loop_control_total: Integer = 0
+
+for control_index in 0..8:
+    if control_index == 2:
+        continue
+
+    if control_index == 5:
+        break
+
+    loop_control_total += control_index
+
+print(loop_control_total)
+
+
+print("=== Nested loops and loop-target restoration ===")
+
+var nested_total: Integer = 0
+
+for outer_index in 0..4:
+    for inner_index in 0..3:
+        if inner_index == 1:
+            continue
+
+        if inner_index == 2:
+            break
+
+        nested_total += 1
+
+    if outer_index == 1:
+        continue
+
+    if outer_index == 2:
+        break
+
+    nested_total += 10
+
+print(nested_total)
+
+
+# ============================================================
+# Expected stdout
+# ============================================================
+# === Boolean logic and short-circuiting ===
+# true
+# false
+# true
+# PASS: false AND skipped its right side
+# PASS: true OR skipped its right side
+# AND RHS EXECUTED
+# PASS: true AND evaluated its right side
+# OR RHS EXECUTED
+# PASS: false OR evaluated its right side
+# === Conditionals, functions, and returns ===
+# -1
+# 0
+# 1
+# 120
+# -7
+# 25
+# === Block-local declarations ===
+# 12
+# 34
+# === Increment, decrement, and compound assignment ===
+# 3
+# 5
+# 5
+# 3
+# 24
+# === While loop, continue, and break ===
+# 6
+# 13
+# === For-loop range, continue, and break ===
+# 10
+# 8
+# === Nested loops and loop-target restoration ===
+# 13

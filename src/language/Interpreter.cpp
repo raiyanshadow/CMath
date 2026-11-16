@@ -846,7 +846,7 @@ namespace cmath::language::detail {
                         lastValue_ = format(value);
                         return {};
                     } else if constexpr(std::is_same_v<T, IRExpressionStatement>) {
-                        auto value = evaluate(node.expresison, environment);
+                        auto value = evaluate(node.expression, environment);
                         if (!diagnostics_.empty()) return {};
 
                         if (value.type != ValueType::Unit) 

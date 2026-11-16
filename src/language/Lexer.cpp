@@ -65,6 +65,10 @@ namespace cmath::language::detail {
         }
 
         // Ignore blank lines.
+        if (peek() == '\r' && peek(1) == '\n') {
+            advance();
+        }
+        
         if (peek() == '\n') {
             advance();
             atLineStart_ = true;
