@@ -1042,10 +1042,10 @@ namespace cmath::language::detail {
                             if (!diagnostics_.empty()) return {};
                             if (node.typeInfo.isFunction()) {
                                 if (value.typeInfo != node.typeInfo) {
-                                    throw RuntimeFault(statement.location, "TypeError", "Cannot initialize '" + node.name + "' with " + typeName(value.typeInfo) + "; expects " + typeName(node.typeInfo));
-                                } else {
-                                    value = promote(value, node.type, statement.location);
-                                }
+                                    throw RuntimeFault(statement.location, "TypeError", "Cannot return " + typeName(value.typeInfo) + "; expected " + typeName(node.typeInfo));
+                                } 
+                            } else {
+                                value = promote(value, node.type, statement.location);
                             }
                         }
                         return {ControlFlow::Return, value};
@@ -1111,7 +1111,7 @@ namespace cmath::language::detail {
                         auto iteratorEnvironment = std::make_shared<Environment>();
                         iteratorEnvironment->parent = environment.shared_from_this();
                         iteratorEnvironment->mutableBindings[node.iterator] = false;
-                        iteratorEnvironment->values[node.iterator] = std::make_shared<RuntimeValue>{ValueType::Integer, static_cast<std::int64_t>(start)};
+                        iteratorEnvironment->values[node.iterator] = std::make_shared<RuntimeValue>(ValueType::Integer, static_cast<std::int64_t>(start));
 
                         for (std::int64_t index = start; index < end;) {
                             if (!consumeInstruction(statement.location)) return {};

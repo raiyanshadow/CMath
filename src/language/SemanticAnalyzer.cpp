@@ -437,6 +437,71 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
     for (std::size_t i = 1; i < expression->children.size(); ++i)
         arguments.push_back(analyzeExpression(expression->children[i], scope));
 
+    auto compatible = [](const LanguageType& actual, const LanguageType& expected) -> bool {
+        if (expected.kind == LanguageType::Kind::Function) {
+            return actual == expected;
+        }
+
+        return actual.kind == LanguageType::Kind::Scalar && canWiden(actual.scalar, expected.scalar);
+    };
+
+    if (const auto* symbol = findSymbol(scope, name)) {
+        if (!symbol->typeInfo.isFunction()) {
+            error(expression->location, "TypeError", "Value '" + name + "' is not callable");
+            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
+            return ValueType::Error;
+        }
+
+        const auto& signature = symbol->typeInfo;
+
+        if (!signature.result) {
+            error(expression->location, "TypeError", "Function value '" + name + "' has an incomplete signature");
+            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
+            return ValueType::Error;
+        }
+
+        if (arguments.size() != signature.parameters.size()) {
+            error(expression->location, "TypeError", "Function value '" + name + "' expects " + std::to_string(signature.parameters.size()) + " argument(s), but received " + std::to_string(arguments.size()));
+        } else {
+            for (std::size_t i = 0; i < arguments.size(); ++i) {
+                const auto& expected = signature.parameters[i];
+                if (!compatible(arguments[i]->typeInfo, expected)) {
+                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i+1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) + "; expected " + typeName(expected));
+                }
+            }
+        }
+
+        std::vector<IRExprPtr> callChildren;
+
+        callChildren.push_back(analyzeExpression(expression->children.front(), scope));
+        callChildren.insert(callChildren.end(), arguments.begin(), arguments.end());
+        const LanguageType resultInfo = *signature.result;
+        const ValueType resultType = resultInfo.kind == LanguageType::Kind::Scalar ? resultInfo.scalar : ValueType::Error;
+
+        result = makeIR(IRExpression::Kind::Call, name, resultType, expression->location, std::move(callChildren));
+        result->typeInfo = resultInfo;
+        result->indirectCall = true;
+
+        return resultType;
+    }
+
+    if (const auto function = signatures_.find(name); function != signatures_.end()) {
+        if (arguments.size() != function->second.parameters.size()) {
+            error(expression->location, "RuntimeError", "Function '" + name + "' received the wrong number of arguments");
+        } else {
+            for (std::size_t i = 0; i < arguments.size(); i++) {
+                const auto& expected = function->second.parameterTypes[i];
+                if (!compatible(arguments[i]->typeInfo, expected)) {
+                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i + 1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) +"; expected " + typeName(expected));
+                }
+            }
+        }
+
+        result = makeIR(IRExpression::Kind::Call, name, function->second.result, expression->location, std::move(arguments));
+        result->typeInfo = function->second.resultType;
+        return function->second.result;
+    }
+
     auto arity = [&](std::size_t expected) {
         if (arguments.size() != expected) {
             error(expression->location, "RuntimeError", "Function '" + name + "' expects " +
@@ -451,23 +516,7 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
     };
 
     ValueType returnType = ValueType::Error;
-    LanguageType returnTypeInfo = LanguageType::scalarType(ValueType::Error);
-    if (const auto function = signatures_.find(name); function != signatures_.end()) {
-        if (arguments.size() != function->second.parameters.size()) {
-            error(expression->location, "RuntimeError", "Function '" + name + "' received the wrong number of arguments");
-        } else {
-            for (std::size_t i = 0; i < arguments.size(); ++i) {
-                const auto& expected = function->second.parameterTypes[i];
-                const bool compatible = expected.kind == LanguageType::Kind::Function ? arguments[i]->typeInfo == expected : canWiden(arguments[i]->type, expected.scalar);
-
-                if (!compatible) {
-                    error(arguments[i]->location, "RuntimeError", "Argument " + std::to_string(i + 1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) + "; expected " + typeName(expected));
-                }
-            }
-        }
-        returnType = function->second.result;
-        returnTypeInfo = function->second.resultType;
-    } else if (name == "print") {
+    if (name == "print") {
         returnType = ValueType::Unit;
     } else if (name == "sqrt" || name == "sin" || name == "cos" || name == "tan" ||
                name == "exp" || name == "log" || name == "abs" || name == "floor" ||
@@ -500,55 +549,9 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
         error(expression->location, "RuntimeError", "Unknown function '" + name + "'");
     }
 
-    if (returnTypeInfo.kind == LanguageType::Kind::Scalar && returnTypeInfo.scalar == ValueType::Error) {
-        returnTypeInfo = LanguageType::scalarType(returnType);
-    }
-
-    if (const auto* symbol = findSymbol(scope, name)) {
-        if (!symbol->typeInfo.isFunction()) {
-            error(expression->location, "TypeError", "Value '" + name + "' is not callable");
-            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
-            return ValueType::Error;
-        }
-        const auto& signature = symbol->typeInfo;
-
-        if (!signature.result) {
-            error(expression->location, "TypeError", "Function value '" + name + "' has an incomplete signature");
-            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
-            return ValueType::Error;
-        }
-
-        if (arguments.size() != signature.parameters.size()) {
-            error(expression->location, "TypeError", "Function value '" + name + "' expects " + std::to_string(signature.parameters.size()) + " argument(s), but received " + std::to_string(arguments.size()));
-        } else {
-            for (std::size_t i = 0; i < arguments.size(); ++i) {
-                const auto& expected = signature.parameters[i];
-
-                const bool compatible = expected.kind == LanguageType::Kind::Function ? arguments[i]->typeInfo == expected : (arguments[i]->typeInfo.kind == LanguageType::Kind::Scalar && canWiden(arguments[i]->type, expected.scalar));
-                if (!compatible) {
-                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i + 1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) + "; expected " + typeName(expected));
-                }
-            }
-        }
-
-        std::vector<IRExprPtr> callChildren;
-        callChildren.push_back(analyzeExpression(expression->children.front(), scope));
-        callChildren.insert(callChildren.end(), arguments.begin(), arguments.end());
-
-        const LanguageType resultInfo = *signature.result;
-        const ValueType resultType = resultInfo.kind == LanguageType::Kind::Scalar ? resultInfo.scalar : ValueType::Error;
-
-        result = makeIR(IRExpression::Kind::Call, name, resultType, expression->location, std::move(callChildren));
-
-        result->typeInfo = resultInfo;
-        result->indirectCall = true;
-
-        return resultType;
-    }
-
     result = makeIR(IRExpression::Kind::Call, name, returnType, expression->location,
                     std::move(arguments));
-    result->typeInfo = returnTypeInfo;
+    result->typeInfo = LanguageType::scalarType(returnType);
     return returnType;
 }
 
@@ -712,29 +715,29 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
 
                 auto resolvedReturn = resolveType(returnSyntax, statement.location);
 
-                LanguageType returnType = LanguageType::scalarType(ValueType::Error);
+                LanguageType lambdaReturnType = LanguageType::scalarType(ValueType::Error);
 
                 if (resolvedReturn) {
-                    returnType = *resolvedReturn;
+                    lambdaReturnType = *resolvedReturn;
                 } else {
                     valid = false;
                 }
 
-                function->returnType = returnType.kind == LanguageType::Kind::Scalar ? returnType.scalar : ValueType::Error;
-                function->returnTypeInfo = returnType;
+                function->returnType = lambdaReturnType.kind == LanguageType::Kind::Scalar ? lambdaReturnType.scalar : ValueType::Error;
+                function->returnTypeInfo = lambdaReturnType;
 
                 AstBlock emptyBody;
                 const AstBlock& lambdaBody = statement.body ? *statement.body : emptyBody;
 
-                function->body = analyzeBlock(lambdaBody, functionScope, true, returnType, 0);
-                const bool returnsUnit = returnType.kind == LanguageType::Kind::Scalar && returnType.scalar == ValueType::Unit;
+                function->body = analyzeBlock(lambdaBody, functionScope, true, lambdaReturnType, 0);
+                const bool returnsUnit = lambdaReturnType.kind == LanguageType::Kind::Scalar && lambdaReturnType.scalar == ValueType::Unit;
 
                 if (!returnsUnit && function->body.flow.canFallThrough) {
                     error(statement.location, "ControlFlowError", "Lambda '" + statement.name + "' does not return a value on every possible execution path");
                     valid = false;
                 }
 
-                LanguageType lambdaType = LanguageType::functionType(std::move(parameterTypes), returnType);
+                LanguageType lambdaType = LanguageType::functionType(std::move(parameterTypes), lambdaReturnType);
 
                 if (valid) {
                     scope.symbols.emplace(

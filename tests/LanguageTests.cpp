@@ -435,6 +435,24 @@ print(apply(wrong))
         );
     }
 },
+{
+    "Function value rejected as scalar argument",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def expects_integer(x: Integer) -> Integer:
+    return x
+
+lambda callback = fn(x: Integer) -> Integer:
+    return x * 2
+
+print(expects_integer(callback))
+)"
+        );
+    }
+},
         {
             "Static division by zero",
             [] {
