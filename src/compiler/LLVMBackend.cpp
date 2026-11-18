@@ -515,6 +515,10 @@ private:
 
     bool declareUserFunctions() {
         for (const auto& [name, function] : program_.functions) {
+            if (function.returnTypeInfo.isFunction()) {
+                error(function.location, "FeatureError", "Native compilation of function returning function value is not supported yet.");
+                return false;
+            }
             std::vector<llvm::Type*> parameters;
             parameters.reserve(function.parameters.size());
 
@@ -522,9 +526,14 @@ private:
                 if (parameter.type == ValueType::Unit) {
                     error(
                         function.location,
-                        "NAT036",
+                        "TypeError",
                         "Function parameters cannot have type Unit."
                     );
+                    return false;
+                }
+
+                if (parameter.typeInfo.isFunction()) {
+                    error(function.location, "FeatureError", "Native compilation of function-valued parameters is not supported yet");
                     return false;
                 }
 
@@ -1041,6 +1050,11 @@ private:
             }
 
             case IRExpression::Kind::Call: {
+                if (expression->indirectCall) {
+                    error(expression->location, "FeatureError", "Native compilation of indirect function calls is not supported yet");
+                    return nullptr;
+                }
+
                 auto* value = emitCall(expression);
 
                 if (
@@ -2787,6 +2801,11 @@ private:
                 using T = std::decay_t<decltype(node)>;
 
                 if constexpr(std::is_same_v<T, IRDeclaration>) {
+                    if (node.lambdaFunction || node.typeInfo.isFunction()) {
+                        error(statement.location, "FeatureError", "Native compilation of lambda values and closures is not supported yet");
+                        return false;
+                    }
+
                     if (node.type == ValueType::Unit) {
                         error(statement.location, "CompileError", "Unit values cannot be stored in variables");
                         return false;

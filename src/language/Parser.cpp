@@ -52,6 +52,7 @@ namespace cmath::language::detail {
                 case TokenKind::Let:
                 case TokenKind::Var:
                 case TokenKind::Def:
+                case TokenKind::Lambda:
                 case TokenKind::Return:
                 case TokenKind::If:
                 case TokenKind::While:
@@ -102,6 +103,7 @@ namespace cmath::language::detail {
     Statement Parser::parseStatement() {
         if (check(TokenKind::Let) || check(TokenKind::Var)) return parseVariable();
         if (check(TokenKind::Def)) return parseFunction();
+        if (check(TokenKind::Lambda)) return parseLambda();
         if (check(TokenKind::Return)) return parseReturn();
         if (check(TokenKind::If)) return parseIf();
         if (check(TokenKind::While)) return parseWhile();
@@ -195,6 +197,90 @@ namespace cmath::language::detail {
             error(peek(), "ParseError", "Function return types are required");
         }
         if (!consume(TokenKind::Colon, "Expected ':' after function signature")) {
+            synchronize();
+            return statement;
+        }
+
+        statement.body = parseIndentedBlock();
+        return statement;
+    }
+
+    Statement Parser::parseLambda() {
+        const Token keyword = advance();
+
+        Statement statement;
+        statement.kind = Statement::Kind::Lambda;
+        statement.location = keyword.location;
+        statement.mutableBinding = false;
+
+        const Token name = peek();
+
+        if (!consume(TokenKind::Identifier, "Expected a name after 'lambda'")) {
+            synchronize();
+            return statement;
+        }
+
+        statement.name = name.lexeme;
+
+        if (!consume(TokenKind::Equal, "Expected '=' after lambda name")) {
+            synchronize();
+            return statement;
+        }
+
+        if (!consume(TokenKind::Fn, "Expected 'fn' after lambda assignment")) {
+            synchronize();
+            return statement;
+        }
+
+        if (!consume(TokenKind::LeftParen, "Expected '(' after 'fn'")) {
+            synchronize();
+            return statement;
+        }
+
+        if (!check(TokenKind::RightParen)) {
+            do {
+                const Token parameterName = peek();
+
+                if (!consume(TokenKind::Identifier, "Expected lambda parameter name")) {
+                    synchronize();
+                    return statement;
+                }
+
+                if (!consume(TokenKind::Colon, "Lambda parameters require type annotations")) {
+                    synchronize();
+                    return statement;
+                }
+
+                ParameterAst parameter;
+                parameter.name = parameterName.lexeme;
+                parameter.location = parameterName.location;
+                parameter.typeSyntax = parseTypeSyntax();
+
+                if (parameter.typeSyntax.kind == TypeSyntax::Kind::Named) {
+                    parameter.typeName = parameter.typeSyntax.name;
+                }
+
+                statement.parameters.push_back(std::move(parameter));
+            } while (match(TokenKind::Comma));
+        }
+
+        if (!consume(TokenKind::RightParen, "Expected ')' after lambda parameters")) {
+            synchronize();
+            return statement;
+        }
+
+        if (!consume(TokenKind::Arrow, "Expected '->' after lambda parameters")) {
+            synchronize();
+            return statement;
+        }
+
+        statement.returnTypeSyntax = parseTypeSyntax();
+
+        if (statement.returnTypeSyntax.kind == TypeSyntax::Kind::Named) {
+            statement.returnType = statement.returnTypeSyntax.name;
+        }
+
+        if (!consume(TokenKind::Colon, "Expected ':' after lambda signatures")) {
             synchronize();
             return statement;
         }

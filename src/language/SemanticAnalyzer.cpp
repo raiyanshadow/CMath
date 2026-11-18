@@ -80,8 +80,8 @@ std::string typeName(const LanguageType& type) {
     std::string result = "fn(";
     
     for (std::size_t i = 0; i < type.parameters.size(); ++i) {
-        if (i != 0) result == ", ";
-        result == typeName(type.parameters[i]);
+        if (i != 0) result += ", ";
+        result += typeName(type.parameters[i]);
     }
 
     result += ") -> ";
@@ -504,12 +504,48 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
         returnTypeInfo = LanguageType::scalarType(returnType);
     }
 
-    if (const auto* symbol = findSymbol(scope, name); symbol && symbol->typeInfo.isFunction()) {
-        error(expression->location, "FeatureError", "Calling function-valued variables is not implemented yet");
-        result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
-        return ValueType::Error;
+    if (const auto* symbol = findSymbol(scope, name)) {
+        if (!symbol->typeInfo.isFunction()) {
+            error(expression->location, "TypeError", "Value '" + name + "' is not callable");
+            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
+            return ValueType::Error;
+        }
+        const auto& signature = symbol->typeInfo;
+
+        if (!signature.result) {
+            error(expression->location, "TypeError", "Function value '" + name + "' has an incomplete signature");
+            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
+            return ValueType::Error;
+        }
+
+        if (arguments.size() != signature.parameters.size()) {
+            error(expression->location, "TypeError", "Function value '" + name + "' expects " + std::to_string(signature.parameters.size()) + " argument(s), but received " + std::to_string(arguments.size()));
+        } else {
+            for (std::size_t i = 0; i < arguments.size(); ++i) {
+                const auto& expected = signature.parameters[i];
+
+                const bool compatible = expected.kind == LanguageType::Kind::Function ? arguments[i]->typeInfo == expected : (arguments[i]->typeInfo.kind == LanguageType::Kind::Scalar && canWiden(arguments[i]->type, expected.scalar));
+                if (!compatible) {
+                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i + 1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) + "; expected " + typeName(expected));
+                }
+            }
+        }
+
+        std::vector<IRExprPtr> callChildren;
+        callChildren.push_back(analyzeExpression(expression->children.front(), scope));
+        callChildren.insert(callChildren.end(), arguments.begin(), arguments.end());
+
+        const LanguageType resultInfo = *signature.result;
+        const ValueType resultType = resultInfo.kind == LanguageType::Kind::Scalar ? resultInfo.scalar : ValueType::Error;
+
+        result = makeIR(IRExpression::Kind::Call, name, resultType, expression->location, std::move(callChildren));
+
+        result->typeInfo = resultInfo;
+        result->indirectCall = true;
+
+        return resultType;
     }
- 
+
     result = makeIR(IRExpression::Kind::Call, name, returnType, expression->location,
                     std::move(arguments));
     result->typeInfo = returnTypeInfo;
@@ -598,11 +634,124 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                 declaration.type = declared;
                 declaration.mutableBinding = statement.mutableBinding;
                 declaration.initializer = std::move(initializer);
+                declaration.typeInfo = declaredInfo;
 
                 append(std::move(declaration), statement.location);
                 break;
             }
+            case Statement::Kind::Lambda: {
+                bool valid = true;
 
+                if (isReservedName(statement.name) || signatures_.contains(statement.name)) {
+                    error(statement.location, "SemanticError", "Lambda name '" + statement.name + "' is reserved");
+                    valid = false;
+                }
+
+                if (scope.symbols.contains(statement.name)) {
+                    error(statement.location, "NameError", "Name '" + statement.name + "' is already declared in this scope");
+                    valid = false;
+                } else if (!allowShadowing_ && scope.parent && findSymbol(*scope.parent, statement.name)) {
+                    error(statement.location, "NameError", "Lambda declaration '" + statement.name + "' shadows an existing name");
+                    valid = false;
+                }
+
+                auto function = std::make_shared<IRFunction>();
+                function->name = statement.name;
+                function->location = statement.location;
+
+                Scope functionScope;
+                functionScope.parent = &scope;
+
+                std::unordered_set<std::string> parameterNames;
+                std::vector<LanguageType> parameterTypes;
+
+                for (const auto& parameter : statement.parameters) {
+                    if (isReservedName(parameter.name)) {
+                        error(parameter.location, "SemanticError", "Parameter name '" + parameter.name + "' is reserved");
+                        valid = false;
+                    }
+
+                    if (!parameterNames.insert(parameter.name).second) {
+                        error(parameter.location, "SemanticError", "Duplicate lambda paramter '" + parameter.name + "'");
+                        valid = false;
+                    }
+
+                    TypeSyntax syntax = parameter.typeSyntax;
+
+                    if (syntax.kind == TypeSyntax::Kind::Named && syntax.name.empty()) {
+                        syntax.name = parameter.typeName;
+                        syntax.location = parameter.location;
+                    }
+
+                    auto resolved = resolveType(syntax, parameter.location);
+
+                    if (!resolved) {
+                        valid = false;
+                        continue;
+                    }
+
+                    const ValueType scalarType = resolved->kind == LanguageType::Kind::Scalar ? resolved->scalar : ValueType::Error;
+                    parameterTypes.push_back(*resolved);
+
+                    function->parameters.push_back(IRParameter{parameter.name, scalarType, *resolved});
+
+                    if (!allowShadowing_ && functionScope.parent && findSymbol(*functionScope.parent, parameter.name)) {
+                        error(parameter.location, "NameError", "Lambda parameter '" + parameter.name + "' shadows an existing name");
+                        valid = false;
+                    }
+
+                    functionScope.symbols.emplace(parameter.name, SymbolInfo{scalarType, false, *resolved});
+                }
+
+                TypeSyntax returnSyntax = statement.returnTypeSyntax;
+
+                if (returnSyntax.kind == TypeSyntax::Kind::Named && returnSyntax.name.empty()) {
+                    returnSyntax.name = statement.returnType;
+                    returnSyntax.location = statement.location;
+                }
+
+                auto resolvedReturn = resolveType(returnSyntax, statement.location);
+
+                LanguageType returnType = LanguageType::scalarType(ValueType::Error);
+
+                if (resolvedReturn) {
+                    returnType = *resolvedReturn;
+                } else {
+                    valid = false;
+                }
+
+                function->returnType = returnType.kind == LanguageType::Kind::Scalar ? returnType.scalar : ValueType::Error;
+                function->returnTypeInfo = returnType;
+
+                AstBlock emptyBody;
+                const AstBlock& lambdaBody = statement.body ? *statement.body : emptyBody;
+
+                function->body = analyzeBlock(lambdaBody, functionScope, true, returnType, 0);
+                const bool returnsUnit = returnType.kind == LanguageType::Kind::Scalar && returnType.scalar == ValueType::Unit;
+
+                if (!returnsUnit && function->body.flow.canFallThrough) {
+                    error(statement.location, "ControlFlowError", "Lambda '" + statement.name + "' does not return a value on every possible execution path");
+                    valid = false;
+                }
+
+                LanguageType lambdaType = LanguageType::functionType(std::move(parameterTypes), returnType);
+
+                if (valid) {
+                    scope.symbols.emplace(
+                        statement.name, SymbolInfo{ValueType::Error, false, lambdaType}
+                    );
+                }
+
+                IRDeclaration declaration;
+                declaration.name = statement.name;
+                declaration.type = ValueType::Error;
+                declaration.typeInfo = std::move(lambdaType);
+                declaration.mutableBinding = false;
+                declaration.lambdaFunction = std::move(function);
+
+                append(std::move(declaration), statement.location);
+                break;
+            }
             case Statement::Kind::Assignment: {
                 const auto* symbol = findSymbol(scope, statement.name);
 
@@ -638,10 +787,10 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
 
                 auto value = analyzeExpression(valueExpression, scope);
 
-                const bool compatible = symbol->typeInfo.kind == LanguageType::Kind::Function ? value->typeInfo == symbol->typeInfo : canWiden(value->type, symbol->type);
+                const bool compatible = symbol->typeInfo.kind == LanguageType::Kind::Function ? value->typeInfo == symbol->typeInfo : value->typeInfo.kind == LanguageType::Kind::Scalar && canWiden(value->type, symbol->type);
 
                 if (!compatible) {
-                    error(statement.location, "TypeError", "Cannot assign " + typeName(value->type) + " to variable '" + statement.name + "' of type " + typeName(symbol->type));
+                    error(statement.location, "TypeError", "Cannot assign " + typeName(value->typeInfo) + " to variable '" + statement.name + "' of type " + typeName(symbol->typeInfo));
                 }
 
                 IRAssignment assignment;
@@ -682,9 +831,9 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                     error(statement.location, "TypeError", "A function returning " + typeName(returnType) + " must return a value");
                 } else {
                     returnStatement.expression = analyzeExpression(statement.expression, scope);
-                    const bool compatible = returnType.kind == LanguageType::Kind::Function ? returnStatement.expression->typeInfo == returnType : canWiden(returnStatement.expression->type, returnType.scalar);
+                    const bool compatible = returnType.kind == LanguageType::Kind::Function ? returnStatement.expression->typeInfo == returnType : returnStatement.expression->typeInfo.kind == LanguageType::Kind::Scalar && canWiden(returnStatement.expression->type, returnType.scalar);
                     if (!compatible) {
-                        error(statement.expression->location, "TypeError", "Function returns " + typeName(returnStatement.expression->type) + "; declared return type is " + typeName(returnType));
+                        error(statement.expression->location, "TypeError", "Function returns " + typeName(returnStatement.expression->typeInfo) + "; declared return type is " + typeName(returnType));
                     }
                 }
 

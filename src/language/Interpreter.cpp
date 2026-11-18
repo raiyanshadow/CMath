@@ -216,6 +216,9 @@ namespace cmath::language::detail {
 
     std::string Interpreter::format(const RuntimeValue& value) const {
         std::ostringstream stream;
+        if (value.typeInfo.isFunction()) {
+            return "<function>";
+        }
         switch (value.type) {
             case ValueType::Integer: return std::to_string(std::get<std::int64_t>(value.data));
             case ValueType::Rational: {
@@ -280,9 +283,9 @@ namespace cmath::language::detail {
                 case IRExpression::Kind::Variable: {
                     if (expression->text == "pi") return {ValueType::Real, std::numbers::pi};
                     if (expression->text == "e") return {ValueType::Real, std::numbers::e};
-                    for (Environment *current = &environment; current; current = current->parent) {
+                    for (Environment *current = &environment; current; current = current->parent.get()) {
                         const auto found = current->values.find(expression->text);
-                        if (found != current->values.end()) return found->second;
+                        if (found != current->values.end()) return *found->second;
                     } 
                     throw RuntimeFault(expression->location, "RuntimeError", "Variable '" + expression->text + "' is not available at runtime");
                 }
@@ -305,7 +308,7 @@ namespace cmath::language::detail {
                     Environment* target = &environment;
 
                     while (target && !target->values.contains(name)) {
-                        target = target->parent;
+                        target = target->parent.get();
                     }
 
                     if (!target) {
@@ -327,7 +330,7 @@ namespace cmath::language::detail {
                         );
                     }
 
-                    const RuntimeValue previous = target->values.at(name);
+                    const RuntimeValue previous = *target->values.at(name);
                     RuntimeValue updated = previous;
 
                     const bool increment = expression->text == "++";
@@ -407,7 +410,7 @@ namespace cmath::language::detail {
                             );
                     }
 
-                    target->values[name] = updated;
+                    *target->values[name] = updated;
 
                     return expression->postfix ? previous : updated;
                 }
@@ -450,6 +453,33 @@ namespace cmath::language::detail {
                 }
 
                 case IRExpression::Kind::Call: {
+                    if (expression->indirectCall) {
+                        if (expression->children.empty()) {
+                            throw RuntimeFault(expression->location, "RuntimeError", "Indirect function call is missing its callee");
+                        }
+                        RuntimeValue callee = evaluate(expression->children.front(), environment);
+
+                        if (!diagnostics_.empty()) return {};
+
+                        if (!callee.typeInfo.isFunction()) {
+                            throw RuntimeFault(expression->location, "TypeError", "Attempted to call a non-function value");
+                        }
+
+                        const auto* callable = std::get_if<std::shared_ptr<RuntimeCallable>>(&callee.data);
+                        if (!callable || !*callable) {
+                            throw RuntimeFault(expression->location, "RuntimeError", "Function value does not contain a callable");
+                        }
+
+                        std::vector<RuntimeValue> arguments;
+                        arguments.reserve(expression->children.size() - 1);
+
+                        for (std::size_t i = 1; i < expression->children.size(); ++i) {
+                            arguments.push_back(evaluate(expression->children[i], environment));
+                            if (!diagnostics_.empty()) return {};
+                        }
+
+                        return callCallable(*callable, arguments, expression->location);
+                    }
                     std::vector<RuntimeValue> arguments;
                     arguments.reserve(expression->children.size());
                     for (const auto& child: expression->children) {
@@ -867,36 +897,67 @@ namespace cmath::language::detail {
         throw RuntimeFault(location, "RuntimeError", "Unknown built-in function '" + name + "'");
     }
 
+    std::shared_ptr<Interpreter::Environment> Interpreter::captureEnvironment(const std::shared_ptr<Environment>& environment) {
+        if (!environment) return {};
+        auto captured = std::make_shared<Environment>();
+        captured->values = environment->values;
+        captured->mutableBindings = environment->mutableBindings;
+        captured->parent = captureEnvironment(environment->parent);
+
+        return captured;
+    }
+
     RuntimeValue Interpreter::callFunction(const std::string& name, const std::vector<RuntimeValue>& arguments, const SourceLocation& location) {
         const auto found = program_->functions.find(name);
         if (found == program_->functions.end())
             throw RuntimeFault(location, "RuntimeError", "Function '" + name + "' was not found");
-        if (callDepth_ >= options_.maximumCallDepth)
-            throw RuntimeFault(location, "RuntimeError", "Maximum function call depth exceeded");
-        const auto& function = found->second;
+        return invokeFunction(found->second, arguments, globals_, location);
+    }
+
+    RuntimeValue Interpreter::callCallable(const std::shared_ptr<RuntimeCallable>& callable, const std::vector<RuntimeValue>& arguments, const SourceLocation& location) {
+        if (!callable || !callable->function || !callable->closure) {
+            throw RuntimeFault(location, "RuntimeError", "Attempted to invoke an invalid function value");
+        }
+        return invokeFunction(*callable->function, arguments, callable->closure, location);
+    }
+
+    RuntimeValue Interpreter::invokeFunction(const IRFunction& function, const std::vector<RuntimeValue>& arguments, const std::shared_ptr<Environment>& parent, const SourceLocation& location) {
+        if (callDepth_ >= options_.maximumCallDepth) {
+            throw RuntimeFault(location, "RuntimeError", "Maximum call depth exceeded");
+        }
         if (arguments.size() != function.parameters.size()) 
             throw RuntimeFault(location, "RuntimeError", "Function call argument count mismatch");
 
-        Environment local;
-        local.parent = &globals_;
+        auto local = std::make_shared<Environment>();
+        local->parent = parent;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
-            local.values[function.parameters[i].name] = promote(arguments[i], function.parameters[i].type, location);
-            local.mutableBindings[function.parameters[i].name] = false;
+            const auto& parameter = function.parameters[i];
+            RuntimeValue value = arguments[i];
+
+            if (parameter.typeInfo.isFunction()) {
+                if (value.typeInfo != parameter.typeInfo) {
+                    throw RuntimeFault(location, "TypeError", "Argument '" + parameter.name + "' has type " + typeName(value.typeInfo) + "; expected " + typeName(parameter.typeInfo)); 
+                }
+            } else {
+                value = promote(value, parameter.type, location);
+            }
+
+            local->values[parameter.name] = std::make_shared<RuntimeValue>(std::move(value));
+            local->mutableBindings[parameter.name] = false;
         }
 
         ++callDepth_;
-        const auto execution = executeBlock(function.body, local);
+        const auto execution = executeBlock(function.body, *local);
         --callDepth_;
         if (!diagnostics_.empty()) return {};
         if (execution.flow == ControlFlow::Return) return execution.value;
         if (execution.flow != ControlFlow::Normal)
-            throw RuntimeFault(location, "ControlFlowError", "Loop control escaped from function '" + name + "'");
+            throw RuntimeFault(location, "ControlFlowError", "Loop control escaped from function '" + function.name + "'");
         if (function.returnType == ValueType::Unit)
             return {ValueType::Unit, std::monostate{}};
-        
         throw RuntimeFault(location, "RuntimeError", "Function completed without returning a value");
     }
-
+ 
     Interpreter::StatementExecutionResult Interpreter::executeBlock(const IRBlock& block, Environment& environment)
     {
         for (const auto& statement : block.statements) {
@@ -916,21 +977,44 @@ namespace cmath::language::detail {
                     using T = std::decay_t<decltype(node)>;
 
                     if constexpr(std::is_same_v<T, IRDeclaration>) {
-                        auto value = evaluate(node.initializer, environment);
-                        if (!diagnostics_.empty()) return {};
-                        value = promote(value, node.type, statement.location);
-                        environment.values[node.name] = value;
+                        RuntimeValue value;
+                        if (node.lambdaFunction) {
+                            auto callable = std::make_shared<RuntimeCallable>();
+                            callable->function = node.lambdaFunction;
+                            callable->closure = captureEnvironment(environment.shared_from_this());
+                            value = RuntimeValue(node.typeInfo, RuntimeData{std::move(callable)});
+
+                        } else {
+                            value = evaluate(node.initializer, environment);
+                            if (!diagnostics_.empty()) return {};
+                        }
+                        
+                        if (node.typeInfo.isFunction()) {
+                            if (value.typeInfo != node.typeInfo) {
+                                throw RuntimeFault(statement.location, "TypeError", "Cannot initialize '" + node.name + "' with " + typeName(value.typeInfo) + "; expects " + typeName(node.typeInfo));
+                            }
+                        } else {
+                            value = promote(value, node.type, statement.location);
+                        }
+
+                        environment.values[node.name] = std::make_shared<RuntimeValue>(std::move(value));
                         environment.mutableBindings[node.name] = node.mutableBinding;
-                        lastValue_ = format(value);
+                        lastValue_ = format(*environment.values[node.name]);
                         return {};
                     } else if constexpr(std::is_same_v<T, IRAssignment>) {
                         auto value = evaluate(node.expression, environment);
                         if (!diagnostics_.empty()) return {};
-                        value = promote(value, node.type, statement.location);
+                        if (node.typeInfo.isFunction()) {
+                            if (value.typeInfo != node.typeInfo) {
+                                throw RuntimeFault(statement.location, "TypeError", "Cannot initialize '" + node.name + "' with " + typeName(value.typeInfo) + "; expects " + typeName(node.typeInfo));
+                            }
+                        } else {
+                            value = promote(value, node.type, statement.location);
+                        }
 
                         Environment* target = &environment;
                         while (target && !target->values.contains(node.name)) 
-                            target = target->parent;
+                            target = target->parent.get();
                         
                         if (!target)
                             throw RuntimeFault(statement.location, "RuntimeError", "Assignment target '" + node.name + "' is unavailable");
@@ -939,7 +1023,7 @@ namespace cmath::language::detail {
                         if (mutableBinding == target->mutableBindings.end() || !mutableBinding->second) 
                             throw RuntimeFault(statement.location, "MutabilityError", "Assignment target '" + node.name + "' is not mutable");
 
-                        target->values[node.name] = value;
+                        *target->values[node.name] = value;
                         lastValue_ = format(value);
                         return {};
                     } else if constexpr(std::is_same_v<T, IRExpressionStatement>) {
@@ -956,7 +1040,13 @@ namespace cmath::language::detail {
                         if (node.expression) {
                             value = evaluate(node.expression, environment);
                             if (!diagnostics_.empty()) return {};
-                            value = promote(value, node.type, statement.location);
+                            if (node.typeInfo.isFunction()) {
+                                if (value.typeInfo != node.typeInfo) {
+                                    throw RuntimeFault(statement.location, "TypeError", "Cannot initialize '" + node.name + "' with " + typeName(value.typeInfo) + "; expects " + typeName(node.typeInfo));
+                                } else {
+                                    value = promote(value, node.type, statement.location);
+                                }
+                            }
                         }
                         return {ControlFlow::Return, value};
                     } else if constexpr(std::is_same_v<T, IRIf>) {
@@ -971,16 +1061,16 @@ namespace cmath::language::detail {
                             }
 
                             if (std::get<bool>(condition.data)) {
-                                Environment branchEnvironment;
-                                branchEnvironment.parent = &environment;
-                                return executeBlock(*branch.body, branchEnvironment);
+                                auto branchEnvironment = std::make_shared<Environment>();
+                                branchEnvironment->parent = environment.shared_from_this();
+                                return executeBlock(*branch.body, *branchEnvironment);
                             }
                         }
 
                         if (node.elseBody) {
-                            Environment elseEnvironment;
-                            elseEnvironment.parent = &environment;
-                            return executeBlock(*node.elseBody, elseEnvironment);
+                            auto elseEnvironment = std::make_shared<Environment>();
+                            elseEnvironment->parent = environment.shared_from_this();
+                            return executeBlock(*node.elseBody, *elseEnvironment);
                         }
                         return {};
                     } else if constexpr(std::is_same_v<T, IRWhile>) {
@@ -995,9 +1085,9 @@ namespace cmath::language::detail {
                             if (!std::get<bool>(condition.data)) break;
                             if (!consumeInstruction(statement.location)) return {};
 
-                            Environment iterationEnvironment;
-                            iterationEnvironment.parent = &environment;
-                            const auto bodyResult = executeBlock(*node.body, iterationEnvironment);
+                            auto iterationEnvironment = std::make_shared<Environment>();
+                            iterationEnvironment->parent = environment.shared_from_this();
+                            const auto bodyResult = executeBlock(*node.body, *iterationEnvironment);
                             if (!diagnostics_.empty()) return {};
                             if (bodyResult.flow == ControlFlow::Return) return bodyResult;
                             if (bodyResult.flow == ControlFlow::Break) break;
@@ -1018,17 +1108,18 @@ namespace cmath::language::detail {
                         const auto start = std::get<std::int64_t>(startValue.data);
                         const auto end = std::get<std::int64_t>(endValue.data);
 
-                        Environment iteratorEnvironment;
-                        iteratorEnvironment.parent = &environment;
-                        iteratorEnvironment.mutableBindings[node.iterator] = false;
+                        auto iteratorEnvironment = std::make_shared<Environment>();
+                        iteratorEnvironment->parent = environment.shared_from_this();
+                        iteratorEnvironment->mutableBindings[node.iterator] = false;
+                        iteratorEnvironment->values[node.iterator] = std::make_shared<RuntimeValue>{ValueType::Integer, static_cast<std::int64_t>(start)};
 
                         for (std::int64_t index = start; index < end;) {
                             if (!consumeInstruction(statement.location)) return {};
-                            iteratorEnvironment.values[node.iterator] = {ValueType::Integer, index};
+                            *iteratorEnvironment->values[node.iterator] = {ValueType::Integer, index};
 
-                            Environment iterationEnvironment;
-                            iterationEnvironment.parent = &iteratorEnvironment;
-                            const auto bodyResult = executeBlock(*node.body, iterationEnvironment);
+                            auto iterationEnvironment = std::make_shared<Environment>();
+                            iterationEnvironment->parent = iteratorEnvironment;
+                            const auto bodyResult = executeBlock(*node.body, *iterationEnvironment);
                             if (!diagnostics_.empty()) return {};
                             if (bodyResult.flow == ControlFlow::Return) return bodyResult;
                             if (bodyResult.flow == ControlFlow::Break) break;
@@ -1056,12 +1147,12 @@ namespace cmath::language::detail {
         program_ = &program;
         instructionCount_ = 0;
         callDepth_ = 0;
-        globals_ = Environment{};
+        globals_ = std::make_shared<Environment>();
         output_.clear();
         lastValue_.reset();
         diagnostics_.clear();
 
-        const auto execution = executeBlock(program.body, globals_);
+        const auto execution = executeBlock(program.body, *globals_);
         if (diagnostics_.empty() && execution.flow != ControlFlow::Normal) {
             runtimeError({}, "ControlFlowError", "Control flow escaped top-level program.");
         }

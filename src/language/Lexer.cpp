@@ -177,6 +177,7 @@ namespace cmath::language::detail {
             {"domain", TokenKind::Domain}, {"true", TokenKind::True},
             {"false", TokenKind::False}, 
             {"fn", TokenKind::Fn},
+            {"lambda", TokenKind::Lambda},
             
             {"if", TokenKind::If},
             {"elif", TokenKind::Elif}, 

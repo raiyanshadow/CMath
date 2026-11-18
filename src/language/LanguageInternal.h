@@ -16,7 +16,7 @@
 namespace cmath::language::detail {
     enum class TokenKind {
         Identifier, Number, String, 
-        Let, Var, Def, Fn, Return, Domain, True, False,
+        Let, Var, Def, Fn, Lambda, Return, Domain, True, False,
         Plus, Minus, Star, Slash, Percent, Caret,
         PlusPlus, MinusMinus, PlusEqual, MinusEqual, StarEqual, SlashEqual, PercentEqual, CaretEqual,
         Equal, EqualEqual, NotEqual, Less, Greater, LessEqual, GreaterEqual,
@@ -108,6 +108,7 @@ namespace cmath::language::detail {
         enum class Kind {
             Variable, 
             Function, 
+            Lambda,
             Return, 
             Expression, 
             Assignment,
@@ -166,6 +167,7 @@ namespace cmath::language::detail {
             Statement parseStatement();
             Statement parseVariable();
             Statement parseFunction();
+            Statement parseLambda();
             Statement parseReturn();
             Statement parseIf();
             Statement parseWhile();
@@ -256,6 +258,7 @@ namespace cmath::language::detail {
         SourceLocation location{};
         std::vector<std::shared_ptr<IRExpression>> children;
         bool postfix = false;
+        bool indirectCall = false;
         LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
     };
     using IRExprPtr = std::shared_ptr<IRExpression>;
@@ -274,6 +277,7 @@ namespace cmath::language::detail {
     };
 
     struct IRBlock;
+    struct IRFunction;
 
     struct IRDeclaration {
         std::string name;
@@ -281,6 +285,7 @@ namespace cmath::language::detail {
         bool mutableBinding;
         IRExprPtr initializer;
         LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
+        std::shared_ptr<IRFunction> lambdaFunction;
     };
 
     struct IRAssignment {
@@ -430,7 +435,8 @@ namespace cmath::language::detail {
         std::int64_t denominator;
     };
 
-    struct RuntimeCallable {};
+    struct RuntimeEnvironment;
+    struct RuntimeCallable;
     
     using RuntimeData = std::variant<std::int64_t, RationalValue, double,
                                     std::complex<double>, bool, std::string,
@@ -450,6 +456,17 @@ namespace cmath::language::detail {
         : type(descriptor.kind == LanguageType::Kind::Scalar ? descriptor.scalar : ValueType::Error), data(std::move(value)), typeInfo(std::move(descriptor)) {}
     };
 
+    struct RuntimeEnvironment : std::enable_shared_from_this<RuntimeEnvironment> {
+        std::unordered_map<std::string, std::shared_ptr<RuntimeValue>> values;
+        std::unordered_map<std::string, bool> mutableBindings;
+        std::shared_ptr<RuntimeEnvironment> parent;
+    };
+
+    struct RuntimeCallable {
+        std::shared_ptr<IRFunction> function;
+        std::shared_ptr<RuntimeEnvironment> closure;
+    };
+
     struct RuntimeResult {
         bool succeeded = false;
         std::string output;
@@ -462,11 +479,7 @@ namespace cmath::language::detail {
             explicit Interpreter(const ExecutionOptions& options);
             RuntimeResult execute(const ProgramIR& program);
         private:
-            struct Environment {
-                std::unordered_map<std::string, RuntimeValue> values;
-                std::unordered_map<std::string, bool> mutableBindings;
-                Environment* parent = nullptr;
-            };
+            using Environment = RuntimeEnvironment;
 
             enum class ControlFlow {
                 Normal,
@@ -486,6 +499,9 @@ namespace cmath::language::detail {
             RuntimeValue callFunction(const std::string& name,
                                       const std::vector<RuntimeValue>& arguments,
                                       const SourceLocation& location);
+            RuntimeValue callCallable(const std::shared_ptr<RuntimeCallable>& callable, const std::vector<RuntimeValue>& arguments, const SourceLocation& location);
+            RuntimeValue invokeFunction(const IRFunction& function, const std::vector<RuntimeValue>& arguments, const std::shared_ptr<Environment>& parent, const SourceLocation& location);
+            std::shared_ptr<Environment> captureEnvironment(const std::shared_ptr<Environment>& environment);
             RuntimeValue callBuiltin(const std::string& name,
                                      const std::vector<RuntimeValue>& arguments,
                                      const SourceLocation& location);
@@ -504,7 +520,7 @@ namespace cmath::language::detail {
             ExecutionOptions options_;
             std::size_t instructionCount_ = 0;
             std::size_t callDepth_ = 0;
-            Environment globals_;
+            std::shared_ptr<Environment> globals_;
             std::string output_;
             std::optional<std::string> lastValue_;
             std::vector<Diagnostic> diagnostics_;

@@ -334,6 +334,107 @@ def invalid(callback: fn(Integer) -> Missing) -> Integer:
         );
     }
 },
+{
+    "Lambda declaration and invocation",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+lambda double = fn(x: Integer) -> Integer:
+    return x * 2
+
+print(double(5))
+)",
+            "10\n"
+        );
+    }
+},
+{
+    "Higher-order function with lambda argument",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def apply(callback: fn(Integer) -> Integer, value: Integer) -> Integer:
+    return callback(value)
+
+lambda triple = fn(x: Integer) -> Integer:
+    return x * 3
+
+print(apply(triple, 5))
+)",
+            "15\n"
+        );
+    }
+},
+{
+    "Returned closure captures local variable",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def make_adder(x: Integer) -> fn(Integer) -> Integer:
+    lambda add = fn(y: Integer) -> Integer:
+        return x + y
+
+    return add
+
+let add_five = make_adder(5)
+
+print(add_five(10))
+print(add_five(20))
+)",
+            "15\n25\n"
+        );
+    }
+},
+{
+    "Mutable captured variable persists between calls",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def make_counter() -> fn() -> Integer:
+    var count: Integer = 0
+
+    lambda next = fn() -> Integer:
+        count += 1
+        return count
+
+    return next
+
+let counter = make_counter()
+
+print(counter())
+print(counter())
+print(counter())
+)",
+            "1\n2\n3\n"
+        );
+    }
+},
+{
+    "Function argument signature mismatch",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def apply(callback: fn(Integer) -> Integer) -> Integer:
+    return callback(5)
+
+lambda wrong = fn(x: Real) -> Real:
+    return x
+
+print(apply(wrong))
+)"
+        );
+    }
+},
         {
             "Static division by zero",
             [] {
