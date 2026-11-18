@@ -453,6 +453,118 @@ print(expects_integer(callback))
         );
     }
 },
+{
+    "Named function assigned to function variable",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+let f: fn(Integer) -> Integer = double
+
+print(f(5))
+print(f(10))
+)",
+            "10\n20\n"
+        );
+    }
+},
+{
+    "Named function passed as higher-order argument",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+def apply(callback: fn(Integer) -> Integer, x: Integer) -> Integer:
+    return callback(x)
+
+print(apply(double, 10))
+)",
+            "20\n"
+        );
+    }
+},
+{
+    "Named function returned from another function",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+def get_function() -> fn(Integer) -> Integer:
+    return double
+
+let f = get_function()
+
+print(f(20))
+)",
+            "40\n"
+        );
+    }
+},
+{
+    "Named function and lambda values coexist",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+lambda triple = fn(x: Integer) -> Integer:
+    return x * 3
+
+def apply(callback: fn(Integer) -> Integer, x: Integer) -> Integer:
+    return callback(x)
+
+print(apply(double, 5))
+print(apply(triple, 5))
+)",
+            "10\n15\n"
+        );
+    }
+},
+{
+    "Named function signature mismatch rejected",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+let f: fn(Real) -> Real = double
+)"
+        );
+    }
+},
+{
+    "Named function cannot initialize scalar variable",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+let f: Integer = double
+)"
+        );
+    }
+},
         {
             "Static division by zero",
             [] {

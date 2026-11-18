@@ -281,6 +281,19 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
                 result->typeInfo = symbol->typeInfo;
                 return result;
             }
+            const auto function = signatures_.find(expression->text);
+            if (function != signatures_.end()) {
+                std::vector<LanguageType> parameterTypes;
+                parameterTypes.reserve(function->second.parameterTypes.size());
+
+                for (const auto& parameterType : function->second.parameterTypes) {
+                    parameterTypes.push_back(parameterType);
+                }
+
+                auto result = makeIR(IRExpression::Kind::Variable, expression->text, ValueType::Error, expression->location);
+                result->typeInfo = LanguageType::functionType(std::move(parameterTypes), function->second.resultType);
+                return result;
+            }
             if (expression->text == "pi" || expression->text == "e")
                 return makeIR(IRExpression::Kind::Variable, expression->text,
                               ValueType::Real, expression->location);
@@ -615,7 +628,9 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                         if (explicitType->kind == LanguageType::Kind::Scalar) {
                             declared = explicitType->scalar;
 
-                            if (!canWiden(initializer->type, declared)) {
+                            if (initializer->typeInfo.kind != LanguageType::Kind::Scalar) {
+                                error(statement.expression ? statement.expression->location : statement.location, "TypeError", "Cannot assign " + typeName(initializer->typeInfo) + " to " + typeName(declaredInfo));
+                            } else if (!canWiden(initializer->type, declared)) {
                                 error(statement.expression ? statement.expression->location : statement.location, "TypeError", "Cannot assign " + typeName(initializer->typeInfo) + " to " + typeName(declaredInfo));
                             }
                         } else {

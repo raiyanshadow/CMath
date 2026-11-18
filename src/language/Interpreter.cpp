@@ -283,6 +283,17 @@ namespace cmath::language::detail {
                 case IRExpression::Kind::Variable: {
                     if (expression->text == "pi") return {ValueType::Real, std::numbers::pi};
                     if (expression->text == "e") return {ValueType::Real, std::numbers::e};
+                    if (program_) {
+                        const auto function = program_->functions.find(expression->text);
+                        if (function != program_->functions.end()) {
+                            auto callable = std::make_shared<RuntimeCallable>();
+
+                            callable->function = std::make_shared<IRFunction>(function->second);
+                            callable->closure = globals_;
+                            return RuntimeValue(expression->typeInfo, RuntimeData{std::move(callable)});
+                        }
+                    }
+
                     for (Environment *current = &environment; current; current = current->parent.get()) {
                         const auto found = current->values.find(expression->text);
                         if (found != current->values.end()) return *found->second;
