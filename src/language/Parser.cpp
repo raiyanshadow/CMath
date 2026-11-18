@@ -120,9 +120,11 @@ namespace cmath::language::detail {
         statement.name = name.lexeme;
         statement.mutableBinding = keyword.kind == TokenKind::Var;
         if (match(TokenKind::Colon)) {
-            const Token type = peek();
-            if (consume(TokenKind::Identifier, "Expected a type name after ':'"))
-                statement.typeName = type.lexeme;
+            statement.typeSyntax = parseTypeSyntax();
+
+            if (statement.typeSyntax.kind == TypeSyntax::Kind::Named) {
+                statement.typeName = statement.typeSyntax.name;
+            }
         }
         if (!consume(TokenKind::Equal, "Expected '=' in variable declaration")) synchronize();
         statement.expression = parseExpression();
@@ -164,12 +166,17 @@ namespace cmath::language::detail {
                     synchronize();
                     return statement;
                 }
-                const Token type = peek();
-                if (!consume(TokenKind::Identifier, "Expected parameter type")) {
-                    synchronize();
-                    return statement;
+
+                ParameterAst parameter;
+                parameter.name = parameterName.lexeme;
+                parameter.location = parameterName.location;
+                parameter.typeSyntax = parseTypeSyntax();
+
+                if (parameter.typeSyntax.kind == TypeSyntax::Kind::Named) {
+                    parameter.typeName = parameter.typeSyntax.name;
                 }
-                statement.parameters.push_back(ParameterAst{parameterName.lexeme, type.lexeme, parameterName.location});
+
+                statement.parameters.push_back(std::move(parameter));
             } while (match(TokenKind::Comma));
         }
 
@@ -179,12 +186,11 @@ namespace cmath::language::detail {
         }
         
         if (match(TokenKind::Arrow)) {
-            const Token resultType = peek();
-            if (!consume(TokenKind::Identifier, "Expected return type after '->'")) {
-                synchronize();
-                return statement;
-            }
-            statement.returnType = resultType.lexeme;
+           statement.returnTypeSyntax = parseTypeSyntax();
+
+           if (statement.returnTypeSyntax.kind == TypeSyntax::Kind::Named) {
+            statement.returnType = statement.returnTypeSyntax.name;
+           }
         } else {
             error(peek(), "ParseError", "Function return types are required");
         }
@@ -195,6 +201,56 @@ namespace cmath::language::detail {
 
         statement.body = parseIndentedBlock();
         return statement;
+    }
+
+    TypeSyntax Parser::parseTypeSyntax() {
+        if (match(TokenKind::Fn)) {
+            const Token functionToken = tokens_[current_ - 1];
+
+            TypeSyntax syntax;
+            syntax.kind = TypeSyntax::Kind::Function;
+            syntax.location = functionToken.location;
+
+            if (!consume(TokenKind::LeftParen, "Expected '(' after 'fn' in function type")) {
+                return syntax;
+            }
+
+            if (!check(TokenKind::RightParen)) {
+                do {
+                    if (check(TokenKind::Identifier) && peek(1).kind == TokenKind::Colon) {
+                        advance();
+                        advance();
+                    }
+
+                    syntax.parameters.push_back(parseTypeSyntax());
+                } while (match(TokenKind::Comma));
+            }
+
+            if (!consume(TokenKind::RightParen, "Expected ')' after function type parameters")) {
+                return syntax;
+            }
+
+            if (!consume(TokenKind::Arrow, "Expected '->' after function type parameters")) {
+                return syntax;
+            }
+
+            syntax.result = std::make_shared<TypeSyntax>(parseTypeSyntax());
+
+            return syntax;
+        }
+
+        const Token name = peek();
+
+        if (!consume(TokenKind::Identifier, "Expected a type name")) {
+            return {};
+        }
+
+        TypeSyntax syntax;
+        syntax.kind = TypeSyntax::Kind::Named;
+        syntax.name = name.lexeme;
+        syntax.location = name.location;
+
+        return syntax;
     }
 
     std::shared_ptr<AstBlock> Parser::parseIndentedBlock() {

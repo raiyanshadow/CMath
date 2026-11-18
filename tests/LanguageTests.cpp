@@ -1,4 +1,3 @@
-
 #include "cmath/language/LanguageEngine.h"
 
 #include <functional>
@@ -190,6 +189,151 @@ print(double(15))
                 );
             }
         },
+                {
+            "Mutually recursive functions",
+            [] {
+                expectOutput(
+                    R"(
+domain Integer
+
+def is_even(n: Integer) -> Boolean:
+    if n == 0:
+        return true
+    else:
+        return is_odd(n - 1)
+
+def is_odd(n: Integer) -> Boolean:
+    if n == 0:
+        return false
+    else:
+        return is_even(n - 1)
+
+print(is_even(10))
+print(is_odd(10))
+print(is_even(9))
+print(is_odd(9))
+)",
+                    "true\nfalse\nfalse\ntrue\n"
+                );
+            }
+        },
+        {
+            "Lexical block scopes",
+            [] {
+                expectOutput(
+                    R"(
+domain Integer
+
+def scoped(x: Integer) -> Integer:
+    let base: Integer = x
+
+    if true:
+        let inner: Integer = x + 2
+        print(inner)
+
+    return base
+
+print(scoped(5))
+)",
+                    "7\n5\n"
+                );
+            }
+        },
+        {
+            "Block variables do not escape their scope",
+            [] {
+                expectCompileFailure(
+                    R"(
+domain Integer
+
+def invalid() -> Integer:
+    if true:
+        let hidden: Integer = 10
+
+    return hidden
+)"
+                );
+            }
+        },
+        {
+            "Complete return-path analysis",
+            [] {
+                expectOutput(
+                    R"(
+domain Integer
+
+def classify(n: Integer) -> Integer:
+    if n > 0:
+        return 1
+    elif n < 0:
+        return -1
+    else:
+        return 0
+
+print(classify(10))
+print(classify(-10))
+print(classify(0))
+)",
+                    "1\n-1\n0\n"
+                );
+            }
+        },
+        {
+            "Incomplete return path rejected",
+            [] {
+                expectCompileFailure(
+                    R"(
+domain Integer
+
+def invalid(n: Integer) -> Integer:
+    if n > 0:
+        return 1
+)"
+                );
+            }
+        },
+        {
+    "Nested function type signatures",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def preserve(callback: fn(x: Integer) -> Real) -> fn(Integer) -> Real:
+    return callback
+
+print(1)
+)",
+            "1\n"
+        );
+    }
+},
+{
+    "Nested function type mismatch",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def invalid(callback: fn(Integer) -> Real) -> fn(Integer) -> Integer:
+    return callback
+)"
+        );
+    }
+},
+{
+    "Unknown type inside function signature",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def invalid(callback: fn(Integer) -> Missing) -> Integer:
+    return 0
+)"
+        );
+    }
+},
         {
             "Static division by zero",
             [] {

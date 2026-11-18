@@ -16,7 +16,7 @@
 namespace cmath::language::detail {
     enum class TokenKind {
         Identifier, Number, String, 
-        Let, Var, Def, Return, Domain, True, False,
+        Let, Var, Def, Fn, Return, Domain, True, False,
         Plus, Minus, Star, Slash, Percent, Caret,
         PlusPlus, MinusMinus, PlusEqual, MinusEqual, StarEqual, SlashEqual, PercentEqual, CaretEqual,
         Equal, EqualEqual, NotEqual, Less, Greater, LessEqual, GreaterEqual,
@@ -77,10 +77,23 @@ namespace cmath::language::detail {
     };
     using ExprPtr = std::shared_ptr<Expr>;
 
+    struct TypeSyntax {
+        enum class Kind {
+            Named, Function
+        };
+
+        Kind kind = Kind::Named;
+        std::string name;
+        std::vector<TypeSyntax> parameters;
+        std::shared_ptr<TypeSyntax> result;
+        SourceLocation location{};
+    };
+
     struct ParameterAst {
         std::string name;
         std::string typeName;
         SourceLocation location{};
+        TypeSyntax typeSyntax;
     };
 
     struct AstBlock;
@@ -116,6 +129,8 @@ namespace cmath::language::detail {
         std::string assignmentOperator = "=";
         std::vector<AstBranch> branches;
         std::shared_ptr<AstBlock> elseBody;
+        TypeSyntax typeSyntax;
+        TypeSyntax returnTypeSyntax;
     };
 
     struct AstBlock {
@@ -157,6 +172,7 @@ namespace cmath::language::detail {
             Statement parseFor();
             Statement parseLoopControl();
             Statement parseAssignmentOrExpression();
+            TypeSyntax parseTypeSyntax();
             
             std::shared_ptr<AstBlock> parseIndentedBlock();
             
@@ -182,6 +198,51 @@ namespace cmath::language::detail {
     };
 
     enum class ValueType {Integer, Rational, Real, Complex, Boolean, String, Unit, Error};
+    
+    struct LanguageType {
+        enum class Kind {Scalar, Function};
+
+        Kind kind = Kind::Scalar;
+        ValueType scalar = ValueType::Error;
+
+        std::vector<LanguageType> parameters;
+        std::shared_ptr<LanguageType> result;
+
+        static LanguageType scalarType(ValueType type) {
+            LanguageType value;
+            value.kind = Kind::Scalar;
+            value.scalar = type;
+            return value;
+        }
+
+        static LanguageType functionType(std::vector<LanguageType> parameterTypes, LanguageType resultType) {
+            LanguageType value;
+            value.kind = Kind::Function;
+            value.parameters = std::move(parameterTypes);
+            value.result = std::make_shared<LanguageType>(std::move(resultType));
+            return value;
+        }
+
+        bool isFunction() const {
+            return kind == Kind::Function;
+        }
+
+        bool operator==(const LanguageType& other) const {
+            if (kind != other.kind) return false;
+
+            if (kind == Kind::Scalar) return scalar == other.scalar;
+            if (parameters != other.parameters) return false;
+
+            if (static_cast<bool>(result) != static_cast<bool>(other.result)) return false;
+            return !result || *result == *other.result;
+        }
+
+        bool operator!=(const LanguageType& other) const {
+            return !(*this == other);
+        }
+    };
+
+    std::string typeName(const LanguageType& type);
     std::string typeName(ValueType type);
     std::optional<ValueType> parseTypeName(const std::string& name);
     bool isNumeric(ValueType type);
@@ -195,12 +256,14 @@ namespace cmath::language::detail {
         SourceLocation location{};
         std::vector<std::shared_ptr<IRExpression>> children;
         bool postfix = false;
+        LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
     };
     using IRExprPtr = std::shared_ptr<IRExpression>;
 
     struct IRParameter {
         std::string name;
         ValueType type = ValueType::Error;
+        LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
     };
 
     struct FlowSummary {
@@ -217,12 +280,14 @@ namespace cmath::language::detail {
         ValueType type;
         bool mutableBinding;
         IRExprPtr initializer;
+        LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
     };
 
     struct IRAssignment {
         std::string name;
         ValueType type;
         IRExprPtr expression;
+        LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
     };
 
     struct IRExpressionStatement {
@@ -232,6 +297,7 @@ namespace cmath::language::detail {
     struct IRReturn {
         ValueType type;
         IRExprPtr expression;
+        LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
     };
 
     struct IRIfBranch {
@@ -288,6 +354,7 @@ namespace cmath::language::detail {
         ValueType returnType = ValueType::Error;
         IRBlock body;
         SourceLocation location{};
+        LanguageType returnTypeInfo = LanguageType::scalarType(ValueType::Error);
     };
 
     struct ProgramIR {
@@ -307,21 +374,40 @@ namespace cmath::language::detail {
             SemanticResult analyze(const AstProgram& ast);
 
         private:
-            struct SymbolInfo {ValueType type; bool mutableBinding;};
+            struct SymbolInfo {
+                ValueType type; 
+                bool mutableBinding;
+                LanguageType typeInfo;
+
+                SymbolInfo(ValueType valueType, bool mutableValue)
+                    : type(valueType), mutableBinding(mutableValue), typeInfo(LanguageType::scalarType(valueType)) {}
+                
+                SymbolInfo(ValueType valueType, bool mutableValue, LanguageType descriptor)
+                : type(valueType), mutableBinding(mutableValue), typeInfo(std::move(descriptor)) {}
+            };
+
             struct Scope {
                 Scope* parent = nullptr;
                 std::unordered_map<std::string, SymbolInfo> symbols;
             };
-            struct FunctionSignature {std::vector<ValueType> parameters; ValueType result;};
+
+            struct FunctionSignature {
+                std::vector<ValueType> parameters; 
+                ValueType result = ValueType::Error;
+
+                std::vector<LanguageType> parameterTypes;
+                LanguageType resultType = LanguageType::scalarType(ValueType::Error);
+            };
 
             void error(const SourceLocation& location, std::string code, std::string message,
             std::vector<std::string> notes = {});
+            std::optional<LanguageType> resolveType(const TypeSyntax& syntax, const SourceLocation& loc);
             std::optional<ValueType> resolveType(const std::string& name, const SourceLocation& loc);
             void collectFunctions(const AstProgram& ast);
             void analyzeFunction(const Statement& statement);
             IRBlock analyzeBlock(const AstBlock& block,
                                                         Scope& scope, bool inFunction,
-                                                        ValueType returnType, std::size_t loopDepth);
+                                                        LanguageType returnType, std::size_t loopDepth);
             const SymbolInfo* findSymbol(const Scope& scope, const std::string& name) const;
             IRExprPtr analyzeExpression(const ExprPtr& expression, const Scope& scope);
             IRExprPtr makeIR(IRExpression::Kind kind, std::string text, ValueType type,
@@ -343,13 +429,25 @@ namespace cmath::language::detail {
         std::int64_t numerator;
         std::int64_t denominator;
     };
+
+    struct RuntimeCallable {};
     
     using RuntimeData = std::variant<std::int64_t, RationalValue, double,
                                     std::complex<double>, bool, std::string,
-                                    std::monostate>;
+                                    std::monostate, std::shared_ptr<RuntimeCallable>>;
     struct RuntimeValue {
         ValueType type = ValueType::Unit;
         RuntimeData data = std::monostate{};
+
+        LanguageType typeInfo = LanguageType::scalarType(ValueType::Unit);
+
+        RuntimeValue() = default;
+
+        RuntimeValue(ValueType valueType, RuntimeData value)
+        : type(valueType), data(std::move(value)), typeInfo(LanguageType::scalarType(valueType)) {}
+
+        RuntimeValue(LanguageType descriptor, RuntimeData value)
+        : type(descriptor.kind == LanguageType::Kind::Scalar ? descriptor.scalar : ValueType::Error), data(std::move(value)), typeInfo(std::move(descriptor)) {}
     };
 
     struct RuntimeResult {

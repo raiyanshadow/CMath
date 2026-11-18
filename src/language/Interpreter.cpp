@@ -188,7 +188,7 @@ namespace cmath::language::detail {
     RuntimeValue Interpreter::promote(const RuntimeValue& value, ValueType target, const SourceLocation& location) {
         if (value.type == target) return value;
         if (!isNumeric(value.type) || !canWiden(value.type, target)) 
-            throw RuntimeFault(location, "RuntimeError", "Invalid runtime conversion from " + typeName(value.type) + " to " + typeName(target) + ".");
+            throw RuntimeFault(location, "RuntimeError", "Invalid runtime conversion from " + typeName(value.typeInfo) + " to " + typeName(target) + ".");
         if (target == ValueType::Rational) {
             if (value.type == ValueType::Integer) 
                 return {target, RationalValue{std::get<std::int64_t>(value.data), 1}};

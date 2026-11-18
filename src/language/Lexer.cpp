@@ -176,6 +176,7 @@ namespace cmath::language::detail {
             {"def", TokenKind::Def}, {"return", TokenKind::Return},
             {"domain", TokenKind::Domain}, {"true", TokenKind::True},
             {"false", TokenKind::False}, 
+            {"fn", TokenKind::Fn},
             
             {"if", TokenKind::If},
             {"elif", TokenKind::Elif}, 
