@@ -1,0 +1,17 @@
+domain Integer
+
+def double(x: Integer) -> Integer:
+    return x * 2
+
+def apply(callback: fn(Integer) -> Integer, value: Integer) -> Integer:
+    return callback(value)
+
+def get_function() -> fn(Integer) -> Integer:
+    return double
+
+let f: fn(Integer) -> Integer = double
+let g = get_function()
+
+print(f(5))
+print(apply(double, 10))
+print(g(20))

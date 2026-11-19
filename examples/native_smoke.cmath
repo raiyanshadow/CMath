@@ -1,5 +1,13 @@
-domain Real
+domain Integer
 
-let x: Real = 10
-let y: Real = 20
-print(x + y)
+def foo(x: Integer, y: Integer) -> Real:
+    if x == 0:
+        if y == 0: 
+            return 0
+        else:
+            return -1
+    return 2*x + y
+
+print(foo(1, 2))
+print(foo(0, 1))
+print(foo(0, 0))

@@ -6,6 +6,7 @@
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
@@ -27,10 +28,11 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <stdexcept>
@@ -55,9 +57,31 @@ using language::detail::IRWhile;
 using language::detail::IRFor;
 using language::detail::IRBreak;
 using language::detail::IRContinue;
+using language::detail::LanguageType;
 using language::detail::ProgramIR;
 using language::detail::RationalValue;
 using language::detail::ValueType;
+
+ struct VariableStorage {
+    llvm::Value* address = nullptr;
+    bool heapAllocated = false;
+};
+
+struct Variable {
+    std::shared_ptr<VariableStorage> storage;
+    llvm::Type* type = nullptr;
+    ValueType typeKind = ValueType::Error;
+    LanguageType typeInfo = LanguageType::scalarType(ValueType::Error);
+
+    Variable() = default;
+
+    Variable(llvm::Value* address, llvm::Type* valueType, ValueType valueKind, LanguageType descriptor = LanguageType::scalarType(ValueType::Error), bool heapAllocated = false) 
+    : storage(std::make_shared<VariableStorage>()), type(valueType), typeKind(valueKind), typeInfo(std::move(descriptor))
+    {
+        storage->address = address;
+        storage->heapAllocated = heapAllocated;
+    }
+};
 
 bool checkedMul64(std::int64_t a, std::int64_t b, std::int64_t& result) {
     if (a == 0 || b == 0) {
@@ -158,11 +182,13 @@ RationalValue parseRationalLiteral(const std::string& text) {
 
 class ModuleGenerator {
 public:
-    ModuleGenerator(llvm::LLVMContext& context, const ProgramIR& program)
+    ModuleGenerator(llvm::LLVMContext& context, const ProgramIR& program, const llvm::DataLayout& dataLayout)
         : context_(context),
           module_(std::make_unique<llvm::Module>("cmath.module", context)),
           builder_(context),
-          program_(program) {}
+          program_(program) {
+            module_->setDataLayout(dataLayout);
+          }
 
     bool generate() {
         declareRuntimeFunctions();
@@ -190,6 +216,46 @@ public:
     }
 
 private:
+    struct LoopTargets{
+        llvm::BasicBlock* breakBlock = nullptr;
+        llvm::BasicBlock* continueBlock = nullptr;
+    };
+
+    llvm::LLVMContext& context_;
+    std::unique_ptr<llvm::Module> module_;
+    llvm::IRBuilder<> builder_;
+    const ProgramIR& program_;
+    std::vector<LoopTargets> loopTargets_;
+
+    std::vector<Diagnostic> diagnostics_;
+
+    std::unordered_map<std::string, Variable> variables_;
+    std::unordered_map<std::string, llvm::Function*> userFunctions_;
+
+    llvm::FunctionCallee printf_;
+    llvm::FunctionCallee abort_;
+    llvm::FunctionCallee fflush_;
+    llvm::FunctionCallee strcmp_;
+    llvm::FunctionCallee pow_;
+    llvm::FunctionCallee malloc_;
+
+    llvm::StructType* rationalType_ = nullptr;
+    llvm::StructType* complexType_ = nullptr;
+    llvm::StructType* rationalDivModType_ = nullptr;
+    llvm::Function* rationalGcd_ = nullptr;
+    llvm::Function* rationalDivMod_ = nullptr;
+
+    llvm::Function* rationalMultiply_ = nullptr;
+    llvm::Function* rationalPower_ = nullptr;
+
+    llvm::StructType* callableType_ = nullptr;
+    std::set<std::string> capturedVariableNames_;
+    std::size_t lambdaCounter_ = 0;
+
+    std::unordered_map<std::string, llvm::FunctionCallee>
+        mathFunctions_;
+    bool inMain_ = false;
+
     void error(
         const SourceLocation& location,
         std::string code,
@@ -449,6 +515,56 @@ private:
         return nullptr;
     }
 
+    llvm::StructType* callableLLVMType() {
+        if (!callableType_) {
+            callableType_ = llvm::StructType::create(context_, "cmath.Callable");
+            callableType_->setBody({builder_.getPtrTy(), builder_.getPtrTy()}, false);
+        }
+        return callableType_;
+    }
+
+    llvm::Type* llvmType(const LanguageType& type) {
+        if (type.kind == LanguageType::Kind::Scalar) {
+            return llvmType(type.scalar);
+        }
+        return callableLLVMType();
+    }
+
+    llvm::FunctionType* functionLLVMType(const LanguageType& functionType) {
+        if (!functionType.isFunction() || !functionType.result) {
+            error({}, "CompileError", "Cannot lower an incomplete function type");
+            return nullptr;
+        }
+
+        std::vector<llvm::Type*> parameters;
+
+        parameters.push_back(builder_.getPtrTy());
+        
+        for (const auto& parameter : functionType.parameters) {
+            if (parameter.kind == LanguageType::Kind::Scalar && parameter.scalar == ValueType::Unit) {
+                error({}, "TypeError", "Function parameters cannot have type Unit");
+                return nullptr;
+            }
+
+            auto* parameterType = llvmType(parameter);
+            if (!parameterType) return nullptr;
+            parameters.push_back(parameterType);
+        }
+
+        auto* returnType = llvmType(*functionType.result);
+        if (!returnType) return nullptr;
+        return llvm::FunctionType::get(returnType, parameters, false);
+    }
+
+    llvm::Value* makeCallable(llvm::Value* code, llvm::Value* environment = nullptr) {
+        auto* undefValue = llvm::UndefValue::get(callableLLVMType());
+        auto* value = builder_.CreateInsertValue(undefValue, code, {0}, "callable.code");
+        if (!environment) {
+            environment = llvm::ConstantPointerNull::get(builder_.getPtrTy());
+        }
+        return builder_.CreateInsertValue(value, environment, {1}, "callable.environment");
+    }
+
     llvm::FunctionCallee declareFunction(
         const std::string& name,
         llvm::Type* returnType,
@@ -491,6 +607,10 @@ private:
             {builder_.getPtrTy(), builder_.getPtrTy()}
         );
 
+        auto* sizeType = module_->getDataLayout().getIntPtrType(context_);
+
+        malloc_ = declareFunction("malloc", builder_.getPtrTy(), {sizeType});
+
         auto* doubleType = builder_.getDoubleTy();
 
         for (const char* name : {
@@ -515,37 +635,25 @@ private:
 
     bool declareUserFunctions() {
         for (const auto& [name, function] : program_.functions) {
-            if (function.returnTypeInfo.isFunction()) {
-                error(function.location, "FeatureError", "Native compilation of function returning function value is not supported yet.");
-                return false;
-            }
             std::vector<llvm::Type*> parameters;
-            parameters.reserve(function.parameters.size());
+            parameters.reserve(function.parameters.size() + 1);
+
+            parameters.push_back(builder_.getPtrTy());
 
             for (const auto& parameter : function.parameters) {
-                if (parameter.type == ValueType::Unit) {
-                    error(
-                        function.location,
-                        "TypeError",
-                        "Function parameters cannot have type Unit."
-                    );
+                if (parameter.typeInfo.kind == LanguageType::Kind::Scalar && parameter.typeInfo.scalar == ValueType::Unit) {
+                    error(function.location, "TypeError", "Function parameters cannot have type Unit");
                     return false;
                 }
 
-                if (parameter.typeInfo.isFunction()) {
-                    error(function.location, "FeatureError", "Native compilation of function-valued parameters is not supported yet");
-                    return false;
-                }
+                auto* type = llvmType(parameter.typeInfo);
 
-                auto* type = llvmType(parameter.type);
-
-                if (!type)
-                    return false;
+                if (!type) return false;
 
                 parameters.push_back(type);
             }
 
-            auto* returnType = llvmType(function.returnType);
+            auto* returnType = llvmType(function.returnTypeInfo);
 
             if (!returnType)
                 return false;
@@ -565,12 +673,13 @@ private:
 
             userFunctions_.emplace(name, nativeFunction);
 
-            std::size_t index = 0;
+            auto argument = nativeFunction->arg_begin();
+            argument->setName("environment");
+            ++argument;
 
-            for (auto& argument : nativeFunction->args()) {
-                argument.setName(
-                    function.parameters[index++].name
-                );
+            for (const auto& parameter : function.parameters) {
+                argument->setName(parameter.name);
+                ++argument;
             }
         }
 
@@ -870,21 +979,23 @@ private:
                 );
 
                 if (found == variables_.end()) {
-                    error(
-                        expression->location,
-                        "CompileError",
-                        "Variable '" + expression->text +
-                            "' is unavailable in this native function"
-                    );
-
-                    return nullptr;
+                    const auto function = userFunctions_.find(expression->text);
+                    if (function != userFunctions_.end()) {
+                        return makeCallable(function->second);
+                    }
+                    error(expression->location, "CompileError", "Variable '" + expression->text + "' is unavailable in this native function");
+                    return nullptr; 
                 }
 
                 auto* loaded = builder_.CreateLoad(
                     found->second.type,
-                    found->second.address,
+                    found->second.storage->address,
                     expression->text + ".load"
                 );
+
+                if (found->second.typeInfo.isFunction()) {
+                    return loaded;
+                }
 
                 if (
                     found->second.typeKind == ValueType::Integer &&
@@ -924,7 +1035,7 @@ private:
                 }
                 
                 const bool increment = expression->text == "++";
-                auto *previous = builder_.CreateLoad(found->second.type, found->second.address, name  + ".increment.old");
+                auto *previous = builder_.CreateLoad(found->second.type, found->second.storage->address, name  + ".increment.old");
 
                 llvm::Value* updated = nullptr;
 
@@ -952,7 +1063,7 @@ private:
                     return nullptr;
                 }
 
-                builder_.CreateStore(updated, found->second.address);
+                builder_.CreateStore(updated, found->second.storage->address);
                 llvm::Value* result = expression->postfix ? previous : updated;
 
                 return coerce(result, found->second.typeKind, effectiveType, expression->location);
@@ -1050,12 +1161,7 @@ private:
             }
 
             case IRExpression::Kind::Call: {
-                if (expression->indirectCall) {
-                    error(expression->location, "FeatureError", "Native compilation of indirect function calls is not supported yet");
-                    return nullptr;
-                }
-
-                auto* value = emitCall(expression);
+                auto* value = expression->indirectCall ? emitIndirectCall(expression) : emitCall(expression);
 
                 if (
                     !value ||
@@ -1081,6 +1187,19 @@ private:
         );
 
         return nullptr;
+    }
+
+    llvm::Value* emitExpression(const IRExprPtr& expression, const LanguageType& expected) {
+        if (expected.kind == LanguageType::Kind::Scalar) {
+            return emitExpression(expression, expected.scalar);
+        }
+
+        if (!expression || expression->typeInfo != expected) {
+            error(expression ? expression->location : SourceLocation(), "TypeError", "Function value does not match the expected function type");
+            return nullptr;
+        }
+
+        return emitExpression(expression);
     }
 
     llvm::Value* emitShortCircuit(const IRExprPtr& expression) {
@@ -2179,6 +2298,339 @@ private:
         builder_.SetInsertPoint(continueBlock);
     }
 
+    llvm::StructType* closureEnvironmentType(std::size_t captureCount) {
+        std::vector<llvm::Type*> fields(captureCount, builder_.getPtrTy());
+        return llvm::StructType::get(context_, fields, false);
+    }
+
+    llvm::Value* allocateHeapStorage(llvm::Type* type, const SourceLocation& location, const std::string& name) {
+        if (!type || !type->isSized()) {
+            error(location, "CompileError", "Cannot allocate storage for an unsized closure value");
+            return nullptr;
+        }
+
+        const auto allocationSize = module_->getDataLayout().getTypeAllocSize(type);
+        if (allocationSize.isScalable()) {
+            error(location, "FeatureError", "Scalable closure storage is not supported");
+            return nullptr;
+        }
+
+        auto* sizeType = module_->getDataLayout().getIntPtrType(context_);
+        auto* sizeValue = llvm::ConstantInt::get(sizeType, allocationSize.getFixedValue());
+        auto* memory = builder_.CreateCall(malloc_, {sizeValue}, name);
+
+        auto* allocationFailed = builder_.CreateICmpEQ(memory, llvm::ConstantPointerNull::get(builder_.getPtrTy()), "closure.allocation.failed");
+        emitAbortIf(allocationFailed, location, "Unable to allocate closure storage");
+        return memory;
+    }
+
+    bool ensureHeapCell(Variable& variable, const SourceLocation& location) {
+        if (!variable.storage || !variable.storage->address) {
+            error(location, "CompileError", "Invalid variable storage during closure capture");
+            return false;
+        } 
+
+        if (variable.storage->heapAllocated) return true;
+        auto* heapCell = allocateHeapStorage(variable.type, location, "closure.capture.call");
+        if (!heapCell) return false;
+
+        auto* previousValue = builder_.CreateLoad(variable.type, variable.storage->address, "clsoure.capture.previous");
+
+        builder_.CreateStore(previousValue, heapCell);
+        variable.storage->address = heapCell;
+        variable.storage->heapAllocated = true;
+
+        return true;
+    }
+
+    void collectExpressionVariableReferences(const IRExprPtr& expression, std::set<std::string>& names) const {
+        if (!expression) return;
+        if (expression->kind == IRExpression::Kind::Variable) {
+            names.insert(expression->text);
+        }
+
+        for (const auto& child : expression->children) {
+            collectExpressionVariableReferences(child, names);
+        }
+    }
+
+    void collectBlockVariableReferences(const language::detail::IRBlock& block, std::set<std::string>& names) const {
+        for (const auto& statement : block.statements) {
+            std::visit(
+                [&](const auto& node) {
+                    using T = std::decay_t<decltype(node)>;
+                    if constexpr(std::is_same_v<T, IRDeclaration>) {
+                        collectExpressionVariableReferences(node.initializer, names);
+                    } else if constexpr(std::is_same_v<T, IRAssignment>) {
+                        names.insert(node.name);
+                        collectExpressionVariableReferences(node.expression, names);
+                    } else if constexpr(std::is_same_v<T, IRExpressionStatement>) {
+                        collectExpressionVariableReferences(node.expression, names);
+                    } else if constexpr(std::is_same_v<T, IRReturn>) {
+                        collectExpressionVariableReferences(node.expression, names);
+                    } else if constexpr(std::is_same_v<T, IRIf>) {
+                        for (const auto& branch : node.branches) {
+                            collectExpressionVariableReferences(branch.condition, names);
+                            if (branch.body)
+                                collectBlockVariableReferences(*branch.body, names);
+                        }
+                        if (node.elseBody)
+                            collectBlockVariableReferences(*node.elseBody, names);
+                    } else if constexpr(std::is_same_v<T, IRWhile>) {
+                        collectExpressionVariableReferences(node.condition, names);
+                        if (node.body)
+                            collectBlockVariableReferences(*node.body, names);
+                    } else if constexpr(std::is_same_v<T, IRFor>) {
+                        collectExpressionVariableReferences(node.start, names);
+                        collectExpressionVariableReferences(node.end, names);
+                        if (node.body)
+                            collectBlockVariableReferences(*node.body, names);
+                    }
+                }, 
+                statement.data
+            );
+        }
+    }
+
+    void collectLambdaCaptureCandidates(const language::detail::IRBlock& block, std::set<std::string>& names) const {
+        for (const auto& statement : block.statements) {
+            std::visit(
+                [&](const auto& node) {
+                    using T = std::decay_t<decltype(node)>;
+
+                    if constexpr(std::is_same_v<T, IRDeclaration>) {
+                        if (node.lambdaFunction) {
+                            collectBlockVariableReferences(node.lambdaFunction->body, names);
+                            collectLambdaCaptureCandidates(node.lambdaFunction->body, names);
+                        }
+                    } else if constexpr(std::is_same_v<T, IRIf>) {
+                        for (const auto& branch : node.branches) {
+                            if (branch.body) 
+                                collectLambdaCaptureCandidates(*branch.body, names);
+                        }
+
+                        if (node.elseBody) 
+                            collectLambdaCaptureCandidates(*node.elseBody, names);
+                    } else if constexpr(std::is_same_v<T, IRWhile>) {
+                        if (node.body)
+                            collectLambdaCaptureCandidates(*node.body, names);
+                    } else if constexpr(std::is_same_v<T, IRFor>) {
+                        collectLambdaCaptureCandidates(*node.body, names);
+                    }
+                },
+                statement.data 
+            );
+        }
+    }
+
+    std::set<std::string> collectLambdaCaptureCandidates(const language::detail::IRBlock& block) const {
+        std::set<std::string> result;
+        collectLambdaCaptureCandidates(block, result);
+        return result;
+    }
+
+    struct ClosureCapture{
+        std::string name;
+        Variable variable;
+    };
+
+    bool emitLambdaFunctionBody(llvm::Function* nativeFunction, const IRFunction& sourceFunction, const std::vector<ClosureCapture>& captures) {
+        const auto previousVariables = variables_;
+        const auto previousLoopTargets = loopTargets_;
+        const auto previousCaptureCandidates = capturedVariableNames_;
+        const bool previousInMain = inMain_;
+
+        bool succeeded = true;
+
+        {
+            llvm::IRBuilder<>::InsertPointGuard insertPointGuard(builder_);
+
+            auto* entry = llvm::BasicBlock::Create(context_, "entry", nativeFunction);
+            builder_.SetInsertPoint(entry);
+
+            variables_.clear();
+            loopTargets_.clear();
+            inMain_ = false;
+
+            capturedVariableNames_ = collectLambdaCaptureCandidates(sourceFunction.body);
+            auto argument = nativeFunction->arg_begin();
+
+            if (argument == nativeFunction->arg_end()) {
+                error(sourceFunction.location, "CompileError", "Native lambda is missing its environment argument");
+                succeeded = false;
+            } else {
+                llvm::Value* environment = &*argument++;
+                environment->setName("environment");
+
+                if (!captures.empty()) {
+                    auto* environmentIsNull = builder_.CreateICmpEQ(environment, llvm::ConstantPointerNull::get(builder_.getPtrTy()), "closure.environment.null");
+                    emitAbortIf(environmentIsNull, sourceFunction.location, "Invalid closure environment");
+                    auto* environmentType = closureEnvironmentType(captures.size());
+                    for (std::size_t i = 0; i < captures.size(); ++i) {
+                        auto* field = builder_.CreateStructGEP(environmentType, environment, static_cast<unsigned>(i), "closure.capture.field");
+                        auto* captureAddress = builder_.CreateLoad(builder_.getPtrTy(), field, captures[i].name + ".capture.address");
+                        Variable capturedVariable(captureAddress, captures[i].variable.type, captures[i].variable.typeKind, captures[i].variable.typeInfo, true);
+                        variables_[captures[i].name] = std::move(capturedVariable);
+                    }
+                }
+
+                for (const auto& parameter : sourceFunction.parameters) {
+                    if (argument == nativeFunction->arg_end()) {
+                        error(sourceFunction.location, "CompileError", "Native lambda is missing a parameter argument");
+                        succeeded = false;
+                        break;
+                    }
+
+                    auto* type = llvmType(parameter.typeInfo);
+
+                    if (!type) {
+                        succeeded = false;
+                        break;
+                    }
+
+                    auto* address = createLocal(parameter.name, type);
+                    if (!address) {
+                        succeeded = false;
+                        break;
+                    }
+
+                    builder_.CreateStore(&*argument, address);
+
+                    Variable variable{address, type, parameter.type, parameter.typeInfo};
+
+                    if (capturedVariableNames_.contains(parameter.name) && !ensureHeapCell(variable, sourceFunction.location)) {
+                        succeeded = false;
+                        break;
+                    }
+
+                    variables_[parameter.name] = std::move(variable);
+                    argument->setName(parameter.name);
+                    ++argument;
+                }
+
+                if (succeeded && argument != nativeFunction->arg_end()) {
+                    error(sourceFunction.location, "CompileError", "Native lambda received unexpected arguments");
+                    succeeded = false;
+                }
+
+                if (succeeded && !emitBlock(sourceFunction.body)) {
+                    succeeded = false;
+                }
+
+                if (succeeded && !currentBlockTerminated()) {
+                    const bool returnsUnit = sourceFunction.returnTypeInfo.kind == LanguageType::Kind::Scalar && sourceFunction.returnTypeInfo.scalar == ValueType::Unit;
+
+                    if (returnsUnit) {
+                        builder_.CreateRetVoid();
+                    } else {
+                        error(sourceFunction.location, "CompileError", "Native lambda '" + sourceFunction.name + "' has a reachable path without a return value");
+                        succeeded = false; 
+                    }
+                }
+            }
+        }
+
+        variables_ = previousVariables;
+        loopTargets_ = previousLoopTargets;
+        capturedVariableNames_ = previousCaptureCandidates;
+        inMain_ = previousInMain;
+
+        return succeeded && diagnostics_.empty();
+    }
+
+    llvm::Value* emitLambdaValue(const IRFunction& sourceFunction, const SourceLocation& location) {
+        std::set<std::string> referencedNames;
+        collectBlockVariableReferences(sourceFunction.body, referencedNames);
+
+        std::vector<ClosureCapture> captures;
+
+        for (const auto& name : referencedNames) {
+            const auto found = variables_.find(name);
+
+            if (found == variables_.end()) continue;
+
+            if (!found->second.storage || !found->second.storage->heapAllocated) {
+                error(location, "CompileError", "Captured variable '" + name + "' was not promoted to heap storage before lambda creation");
+                return nullptr;
+            }
+
+            captures.push_back(ClosureCapture{name, found->second});
+        }
+
+        std::vector<LanguageType> parameterTypes;
+        parameterTypes.reserve(sourceFunction.parameters.size());
+
+        for (const auto& parameter : sourceFunction.parameters)
+            parameterTypes.push_back(parameter.typeInfo);
+
+        const LanguageType signatureInfo = LanguageType::functionType(std::move(parameterTypes), sourceFunction.returnTypeInfo);
+        auto* signature = functionLLVMType(signatureInfo);
+        if (!signature) return nullptr;
+
+        const std::string symbol = "cmath_lambda_" + std::to_string(lambdaCounter_++);
+        auto* nativeFunction = llvm::Function::Create(signature, llvm::Function::InternalLinkage, symbol, module_.get());
+
+        if (!emitLambdaFunctionBody(nativeFunction, sourceFunction, captures)) {
+            return nullptr;
+        }
+
+        llvm::Value* environment = nullptr;
+
+        if (!captures.empty()) {
+            auto* environmentType = closureEnvironmentType(captures.size());
+            environment = allocateHeapStorage(environmentType, location, "closure.environment");
+            if (!environment) return nullptr;
+
+            for (std::size_t i = 0; i < captures.size(); ++i) {
+                auto* field = builder_.CreateStructGEP(environmentType, environment, static_cast<unsigned>(i), "closure.environment.field");
+                builder_.CreateStore(captures[i].variable.storage->address, field);
+            }
+        }
+        return makeCallable(nativeFunction, environment);
+    }
+
+    llvm::Value* emitIndirectCall(const IRExprPtr& expression) {
+        if (!expression || expression->children.empty()) {
+            error(expression ? expression->location : SourceLocation{}, "CompileError", "Malformed indirect function call");
+            return nullptr;
+        }
+        const auto& calleeExpression = expression->children.front();
+        const auto& signature = calleeExpression->typeInfo;
+
+        if (!signature.isFunction() || !signature.result) {
+            error(expression->location, "TypeError", "Indirect call target does not have a valid function type");
+            return nullptr;
+        }
+
+        if (expression->children.size() != signature.parameters.size() + 1) {
+            error(expression->location, "TypeError", "Indirect function call has an incorrect argument count");
+            return nullptr;
+        }
+
+        auto* callable = emitExpression(calleeExpression);
+        if (!callable) return nullptr;
+        auto* code = builder_.CreateExtractValue(callable, {0}, "callable.code");
+        
+        auto* environment = builder_.CreateExtractValue(callable, {1}, "callable.environment");
+        auto* functionType = functionLLVMType(signature);
+        if (!functionType) return nullptr;
+
+        std::vector<llvm::Value*> arguments;
+        arguments.reserve(signature.parameters.size() + 1);
+
+        arguments.push_back(environment);
+
+        for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+            auto* argument = emitExpression(expression->children[i+1], signature.parameters[i]);
+            if (!argument) return nullptr;
+            arguments.push_back(argument);
+        }
+
+        const bool returnsUnit = signature.result->kind == LanguageType::Kind::Scalar && signature.result->scalar == ValueType::Unit;
+
+        return builder_.CreateCall(functionType, code, arguments, returnsUnit ? "" : "call.indirect");
+    }
+
     llvm::Value* emitCall(
         const IRExprPtr& expression
     ) {
@@ -2193,20 +2645,23 @@ private:
             const auto sourceFunction =
                 program_.functions.find(name);
 
+            if (sourceFunction == program_.functions.end()) {
+                error(expression->location, "CompileError", "Missing source declaration for native function '" + name + "'");
+                return nullptr;
+            }
+
             std::vector<llvm::Value*> arguments;
-            arguments.reserve(expression->children.size());
+            arguments.reserve(expression->children.size() + 1);
+            arguments.push_back(llvm::ConstantPointerNull::get(builder_.getPtrTy()));
 
             for (
                 std::size_t i = 0;
                 i < expression->children.size();
                 ++i
             ) {
-                const auto parameterType =
-                    sourceFunction->second.parameters[i].type;
-
                 auto* argument = emitExpression(
                     expression->children[i],
-                    parameterType
+                    sourceFunction->second.parameters[i].typeInfo
                 );
 
                 if (!argument)
@@ -2215,12 +2670,14 @@ private:
                 arguments.push_back(argument);
             }
 
+            const auto& returnType = sourceFunction->second.returnTypeInfo;
+
+            const bool returnsUnit = returnType.kind == LanguageType::Kind::Scalar && returnType.scalar == ValueType::Unit;
+
             return builder_.CreateCall(
                 user->second,
                 arguments,
-                sourceFunction->second.returnType == ValueType::Unit
-                    ? ""
-                    : "call." + name
+                returnsUnit ? "" : "call." + name
             );
         }
 
@@ -2739,17 +3196,26 @@ private:
 
         auto *function = builder_.GetInsertBlock()->getParent();
 
-        auto *iteratorAddress = createLocal(loop.iterator, builder_.getInt64Ty());
+        auto *iteratorLocal = createLocal(loop.iterator, builder_.getInt64Ty());
 
-        if (!iteratorAddress) return false;
+        if (!iteratorLocal) return false;
 
-        builder_.CreateStore(startValue, iteratorAddress);
-        const auto previousVariables = variables_;
-        variables_[loop.iterator] = Variable{
-            iteratorAddress,
+        builder_.CreateStore(startValue, iteratorLocal);
+
+        Variable iteratorVariable{ 
+            iteratorLocal,
             builder_.getInt64Ty(),
-            ValueType::Integer
+            ValueType::Integer,
+            LanguageType::scalarType(ValueType::Integer)
         };
+
+        if (capturedVariableNames_.contains(loop.iterator) && !ensureHeapCell(iteratorVariable, location)) {
+            return false;
+        }
+
+        llvm::Value* iteratorAddress = iteratorVariable.storage->address;
+        const auto previousVariables = variables_;
+        variables_[loop.iterator] = std::move(iteratorVariable);
 
         auto *conditionBlock = llvm::BasicBlock::Create(context_, "for.condition", function);
         auto *bodyBlock = llvm::BasicBlock::Create(context_, "for.body", function);
@@ -2801,25 +3267,40 @@ private:
                 using T = std::decay_t<decltype(node)>;
 
                 if constexpr(std::is_same_v<T, IRDeclaration>) {
-                    if (node.lambdaFunction || node.typeInfo.isFunction()) {
-                        error(statement.location, "FeatureError", "Native compilation of lambda values and closures is not supported yet");
-                        return false;
-                    }
-
-                    if (node.type == ValueType::Unit) {
+                    if (node.typeInfo.kind == LanguageType::Kind::Scalar && node.typeInfo.scalar == ValueType::Unit) {
                         error(statement.location, "CompileError", "Unit values cannot be stored in variables");
                         return false;
                     }
+                    
+                    auto* type = llvmType(node.typeInfo);
 
-                    auto * type = llvmType(node.type);
                     if (!type) return false;
-                    auto *value = emitExpression(node.initializer, node.type);
+
+                    llvm::Value* value = nullptr;
+
+                    if (node.lambdaFunction) {
+                        if (!node.typeInfo.isFunction()) {
+                            error(statement.location, "TypeError", "Lambda declaration does not have a function type");
+                            return false;
+                        }
+                        value = emitLambdaValue(*node.lambdaFunction, statement.location);
+                    } else {
+                        value = emitExpression(node.initializer, node.typeInfo);
+                    }
+
                     if (!value) return false;
+
                     auto *address = createLocal(node.name, type);
                     if (!address) return false;
 
                     builder_.CreateStore(value, address);
-                    variables_[node.name] = Variable{address, type, node.type};
+                    Variable variable{address, type, node.type, node.typeInfo};
+
+                    if (capturedVariableNames_.contains(node.name) && !ensureHeapCell(variable, statement.location)) {
+                        return false;
+                    }
+
+                    variables_[node.name] = std::move(variable);
 
                     return true;
                 } else if constexpr(std::is_same_v<T, IRAssignment>) {
@@ -2829,11 +3310,11 @@ private:
                         return false;
                     }
 
-                    auto *value = emitExpression(node.expression, node.type);
+                    auto *value = emitExpression(node.expression, node.typeInfo);
 
                     if (!value) return false;
 
-                    builder_.CreateStore(value, found->second.address);
+                    builder_.CreateStore(value, found->second.storage->address);
                     return true;
                 } else if constexpr(std::is_same_v<T, IRExpressionStatement>) {
                     return emitExpression(node.expression) != nullptr;
@@ -2846,7 +3327,7 @@ private:
                         return true;
                     }
 
-                    if (node.type == ValueType::Unit) {
+                    if (node.typeInfo.kind == LanguageType::Kind::Scalar && node.typeInfo.scalar == ValueType::Unit) {
                         builder_.CreateRetVoid();
                         return true;
                     }
@@ -2856,7 +3337,7 @@ private:
                         return false;
                     }
 
-                    auto *value = emitExpression(node.expression, node.type);
+                    auto *value = emitExpression(node.expression, node.typeInfo);
 
                     if (!value) return false;
 
@@ -2911,13 +3392,26 @@ private:
         loopTargets_.clear();
         inMain_ = false;
 
-        std::size_t index = 0;
+        capturedVariableNames_ = collectLambdaCaptureCandidates(sourceFunction.body);
 
-        for (auto& argument : function->args()) {
-            const auto& parameter =
-                sourceFunction.parameters[index++];
+        auto argument = function->arg_begin();
 
-            auto* type = llvmType(parameter.type);
+        if (argument == function->arg_end()) {
+            error(sourceFunction.location, "CompileError", "Native function is missing its environment argument");
+            return false;
+        }
+
+        argument->setName("environment");
+        ++argument;
+
+
+        for (const auto& parameter : sourceFunction.parameters) {
+            if (argument == function->arg_end()) {
+                error(sourceFunction.location, "CompileError", "Native function is missing a parameter argument");
+                return false;
+            }
+
+            auto* type = llvmType(parameter.typeInfo);
 
             if (!type)
                 return false;
@@ -2927,18 +3421,24 @@ private:
                 type
             );
 
-            builder_.CreateStore(&argument, address);
+            builder_.CreateStore(&*argument, address);
 
-            variables_[parameter.name] = Variable{
-                address,
-                type,
-                parameter.type
-            };
+            Variable variable{address, type, parameter.type, parameter.typeInfo};
+
+            if (capturedVariableNames_.contains(parameter.name) && !ensureHeapCell(variable, sourceFunction.location)) {
+                return false;
+            }
+
+            variables_[parameter.name] = std::move(variable);
+
+            ++argument;
         }
 
         if (!emitBlock(sourceFunction.body)) return false;
         if (!currentBlockTerminated()) {
-            if (sourceFunction.returnType == ValueType::Unit) {
+            const bool returnsUnit = sourceFunction.returnTypeInfo.kind == LanguageType::Kind::Scalar && sourceFunction.returnTypeInfo.scalar == ValueType::Unit;
+
+            if (returnsUnit) {
                 builder_.CreateRetVoid();
             } else {
                 error(sourceFunction.location, "CompileError", "Native function '" + sourceFunction.name + "' has a reachable path without a return value");
@@ -2973,6 +3473,7 @@ private:
         variables_.clear();
         loopTargets_.clear();
         inMain_ = true;
+        capturedVariableNames_ = collectLambdaCaptureCandidates(program_.body);
 
         if (!emitBlock(program_.body, false)) return false;
 
@@ -2992,47 +3493,6 @@ private:
 
         return true;
     }
-
-    struct Variable {
-        llvm::AllocaInst* address = nullptr;
-        llvm::Type* type = nullptr;
-        ValueType typeKind = ValueType::Error;
-    };
-
-    struct LoopTargets{
-        llvm::BasicBlock* breakBlock = nullptr;
-        llvm::BasicBlock* continueBlock = nullptr;
-    };
-
-    llvm::LLVMContext& context_;
-    std::unique_ptr<llvm::Module> module_;
-    llvm::IRBuilder<> builder_;
-    const ProgramIR& program_;
-    std::vector<LoopTargets> loopTargets_;
-
-    std::vector<Diagnostic> diagnostics_;
-
-    std::unordered_map<std::string, Variable> variables_;
-    std::unordered_map<std::string, llvm::Function*> userFunctions_;
-
-    llvm::FunctionCallee printf_;
-    llvm::FunctionCallee abort_;
-    llvm::FunctionCallee fflush_;
-    llvm::FunctionCallee strcmp_;
-    llvm::FunctionCallee pow_;
-
-    llvm::StructType* rationalType_ = nullptr;
-    llvm::StructType* complexType_ = nullptr;
-    llvm::StructType* rationalDivModType_ = nullptr;
-    llvm::Function* rationalGcd_ = nullptr;
-    llvm::Function* rationalDivMod_ = nullptr;
-
-    llvm::Function* rationalMultiply_ = nullptr;
-    llvm::Function* rationalPower_ = nullptr;
-
-    std::unordered_map<std::string, llvm::FunctionCallee>
-        mathFunctions_;
-    bool inMain_ = false;
 };
 
 llvm::CodeGenOptLevel toLLVMOptimization(
@@ -3183,10 +3643,12 @@ NativeCompileResult LLVMBackend::emitObjectFile(
         }
 
         llvm::LLVMContext context;
+        const llvm::DataLayout dataLayout = targetMachine->createDataLayout();
 
         ModuleGenerator generator(
             context,
-            *program.program_
+            *program.program_,
+            dataLayout
         );
 
         if (!generator.generate()) {

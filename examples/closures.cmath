@@ -1,0 +1,42 @@
+domain Integer
+
+def make_counter(start: Integer) -> fn(Integer) -> Integer:
+    var count: Integer = start
+
+    lambda increment = fn(step: Integer) -> Integer:
+        count += step
+        return count
+
+    return increment
+
+def make_adder(offset: Integer) -> fn(Integer) -> Integer:
+    lambda add = fn(value: Integer) -> Integer:
+        return value + offset
+
+    return add
+
+def make_shifted_twice(offset: Integer) -> fn(Integer) -> Integer:
+    lambda shift = fn(value: Integer) -> Integer:
+        return value + offset
+
+    lambda twice = fn(value: Integer) -> Integer:
+        return shift(shift(value))
+
+    return twice
+
+def apply_twice(callback: fn(Integer) -> Integer, value: Integer) -> Integer:
+    return callback(callback(value))
+
+let counter = make_counter(10)
+
+print(counter(1))
+print(counter(2))
+
+let add7 = make_adder(7)
+
+print(add7(5))
+
+let shiftedTwice = make_shifted_twice(3)
+
+print(shiftedTwice(4))
+print(apply_twice(add7, 1))
