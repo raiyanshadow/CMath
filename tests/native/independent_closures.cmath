@@ -1,0 +1,18 @@
+domain Integer
+
+def make_counter(start: Integer) -> fn() -> Integer:
+    var count: Integer = start
+
+    lambda next = fn() -> Integer:
+        count += 1
+        return count
+
+    return next
+
+let first = make_counter(0)
+let second = make_counter(100)
+
+print(first())
+print(second())
+print(first())
+print(second())

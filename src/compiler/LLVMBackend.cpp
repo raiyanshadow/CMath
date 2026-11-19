@@ -2361,6 +2361,10 @@ private:
                     using T = std::decay_t<decltype(node)>;
                     if constexpr(std::is_same_v<T, IRDeclaration>) {
                         collectExpressionVariableReferences(node.initializer, names);
+
+                        if (node.lambdaFunction) {
+                            collectBlockVariableReferences(node.lambdaFunction->body, names);
+                        }
                     } else if constexpr(std::is_same_v<T, IRAssignment>) {
                         names.insert(node.name);
                         collectExpressionVariableReferences(node.expression, names);

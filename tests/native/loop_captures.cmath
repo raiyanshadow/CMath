@@ -1,0 +1,7 @@
+domain Integer
+
+for iteration in 2..5:
+    lambda read_iteration = fn() -> Integer:
+        return iteration
+
+    print(read_iteration())

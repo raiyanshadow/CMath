@@ -1,0 +1,22 @@
+domain Integer
+
+def double(value: Integer) -> Integer:
+    return value * 2
+
+def add_three(value: Integer) -> Integer:
+    return value + 3
+
+def compose(first: fn(Integer) -> Integer, second: fn(Integer) -> Integer) -> fn(Integer) -> Integer:
+    lambda composed = fn(value: Integer) -> Integer:
+        return first(second(value))
+
+    return composed
+
+def apply(callback: fn(Integer) -> Integer, value: Integer) -> Integer:
+    return callback(value)
+
+let composed = compose(double, add_three)
+
+print(composed(4))
+print(composed(10))
+print(apply(composed, 5))

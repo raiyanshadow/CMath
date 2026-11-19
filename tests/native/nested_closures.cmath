@@ -1,0 +1,20 @@
+domain Integer
+
+def make_nested(base: Integer) -> fn(Integer) -> fn(Integer) -> Integer:
+    var outer: Integer = base
+
+    lambda bind = fn(middle: Integer) -> fn(Integer) -> Integer:
+        var inner: Integer = middle * 2
+
+        lambda combine = fn(extra: Integer) -> Integer:
+            return outer + inner + extra
+
+        return combine
+
+    return bind
+
+let bind = make_nested(10)
+let combine = bind(5)
+
+print(combine(3))
+print(combine(7))
