@@ -82,4 +82,54 @@ if(BUILD_TESTING)
         NAME cmath-language-tests
         COMMAND cmath-language-tests
     )
+
+    if(TARGET mathmake)
+        file(GLOB CMATH_NATIVE_TEST_SOURCES
+            CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/native/*.cmath"
+        )
+
+        foreach(native_source IN LISTS CMATH_NATIVE_TEST_SOURCES)
+            get_filename_component(test_name "${native_source}" NAME_WE)
+
+            set(expected_output
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/native/${test_name}.expected"
+            )
+
+            if(NOT EXISTS "${expected_output}")
+                message(FATAL_ERROR
+                    "Missing expected output for native test '${test_name}': "
+                    "${expected_output}"
+                )
+            endif()
+
+            set(native_output
+                "${CMAKE_CURRENT_BINARY_DIR}/native-test-output/${test_name}${CMAKE_EXECUTABLE_SUFFIX}"
+            )
+
+            add_test(
+                NAME "cmath-native-${test_name}"
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DMATHMAKE=$<TARGET_FILE:mathmake>"
+                    "-DSOURCE=${native_source}"
+                    "-DEXPECTED=${expected_output}"
+                    "-DOUTPUT=${native_output}"
+                    "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/NativeCompilerTest.cmake"
+            )
+
+            set_tests_properties(
+                "cmath-native-${test_name}"
+                PROPERTIES TIMEOUT 120
+            )
+        endforeach()
+
+        message(STATUS
+            "CMath native regression tests: ${CMATH_NATIVE_TEST_SOURCES}"
+        )
+    else()
+        message(STATUS
+            "CMath native regression tests disabled: mathmake target unavailable"
+        )
+    endif()
 endif()
