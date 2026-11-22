@@ -565,6 +565,154 @@ let f: Integer = double
         );
     }
 },
+{
+    "Inferred named function return type",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def double(x: Integer):
+    return x * 2
+
+print(double(6))
+)",
+            "12\n"
+        );
+    }
+},
+{
+    "Inferred lambda return type",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+lambda add = fn(x: Integer, y: Integer):
+    return x + y
+
+print(add(4, 5))
+)",
+            "9\n"
+        );
+    }
+},
+{
+    "Inferred Unit return type",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def announce(value: Integer):
+    print(value)
+
+announce(42)
+)",
+            "42\n"
+        );
+    }
+},
+{
+    "Inferred return type across multiple branches",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def classify(value: Integer):
+    if value > 0:
+        return 1
+    elif value < 0:
+        return 2.5
+    else:
+        return 0
+
+print(classify(5))
+print(classify(-5))
+print(classify(0))
+)",
+            "1\n5/2\n0\n"
+        );
+    }
+},
+{
+    "Inferred mutually recursive return types",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def is_even(n: Integer):
+    if n == 0:
+        return true
+    else:
+        return is_odd(n - 1)
+
+def is_odd(n: Integer):
+    if n == 0:
+        return false
+    else:
+        return is_even(n - 1)
+
+print(is_even(10))
+print(is_odd(10))
+print(is_even(9))
+print(is_odd(9))
+)",
+            "true\nfalse\nfalse\ntrue\n"
+        );
+    }
+},
+{
+    "Inferred recursive numeric return type",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def factorial(n: Integer):
+    if n == 0:
+        return 1
+    else:
+        return n * factorial(n - 1)
+
+print(factorial(5))
+)",
+            "120\n"
+        );
+    }
+},
+{
+    "Conflicting inferred return types rejected",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def invalid(flag: Boolean):
+    if flag:
+        return 10
+    else:
+        return "not an integer"
+)"
+        );
+    }
+},
+{
+    "Incomplete inferred return path rejected",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def invalid(flag: Boolean):
+    if flag:
+        return 10
+)"
+        );
+    }
+},
         {
             "Static division by zero",
             [] {

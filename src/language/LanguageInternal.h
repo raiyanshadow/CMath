@@ -1,7 +1,8 @@
 #pragma once
 
 #include <complex>
-#include <cstdint> 
+#include <cstdint>
+#include <cstddef> 
 #include <memory>
 #include <optional>
 #include <string>
@@ -123,6 +124,7 @@ namespace cmath::language::detail {
         std::string name;
         std::string typeName;
         bool mutableBinding = false;
+        bool inferReturnType = false;
         ExprPtr expression;
         std::vector<ParameterAst> parameters;
         std::string returnType;
@@ -202,13 +204,15 @@ namespace cmath::language::detail {
     enum class ValueType {Integer, Rational, Real, Complex, Boolean, String, Unit, Error};
     
     struct LanguageType {
-        enum class Kind {Scalar, Function};
+        enum class Kind {Scalar, Function, TypeVariable};
 
         Kind kind = Kind::Scalar;
         ValueType scalar = ValueType::Error;
 
         std::vector<LanguageType> parameters;
         std::shared_ptr<LanguageType> result;
+
+        std::size_t variableId = 0;
 
         static LanguageType scalarType(ValueType type) {
             LanguageType value;
@@ -225,14 +229,26 @@ namespace cmath::language::detail {
             return value;
         }
 
+        static LanguageType typeVariable(std::size_t id) {
+            LanguageType value;
+            value.kind = Kind::TypeVariable;
+            value.variableId = id;
+            return value;
+        }
+
         bool isFunction() const {
             return kind == Kind::Function;
+        }
+        
+        bool isTypeVariable() const {
+            return kind == Kind::TypeVariable;
         }
 
         bool operator==(const LanguageType& other) const {
             if (kind != other.kind) return false;
 
             if (kind == Kind::Scalar) return scalar == other.scalar;
+            if (kind == Kind::TypeVariable) return variableId == other.variableId;
             if (parameters != other.parameters) return false;
 
             if (static_cast<bool>(result) != static_cast<bool>(other.result)) return false;
@@ -403,6 +419,21 @@ namespace cmath::language::detail {
                 std::vector<LanguageType> parameterTypes;
                 LanguageType resultType = LanguageType::scalarType(ValueType::Error);
             };
+
+            std::unordered_map<std::size_t, LanguageType> typeSubstitutions_;
+            std::size_t nextTypeVariableId_ = 0;
+
+            LanguageType freshTypeVariable();
+
+            LanguageType resolveTypeVariables(const LanguageType& type) const;
+            bool occursInType(std::size_t variableId, const LanguageType& type) const;
+            bool unifyTypes(const LanguageType& left, const LanguageType& right, const SourceLocation& location, const std::string& context);
+
+            bool containsTypeVariable(const LanguageType& type) const;
+
+            void resolveIRExpressionTypes(IRExprPtr& expression);
+            void resolveIRBlockTypes(IRBlock& block);
+            void resolveIRFunctionTypes(IRFunction& function);
 
             void error(const SourceLocation& location, std::string code, std::string message,
             std::vector<std::string> notes = {});

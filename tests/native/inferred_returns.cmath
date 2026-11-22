@@ -1,0 +1,17 @@
+domain Integer
+
+def factorial(n: Integer):
+    if n == 0:
+        return 1
+    else:
+        return n * factorial(n - 1)
+
+lambda add = fn(x: Integer, y: Integer):
+    return x + y
+
+def announce(value: Integer):
+    print(value)
+
+print(factorial(5))
+print(add(10, 20))
+announce(42)

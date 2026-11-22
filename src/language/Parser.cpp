@@ -194,7 +194,7 @@ namespace cmath::language::detail {
             statement.returnType = statement.returnTypeSyntax.name;
            }
         } else {
-            error(peek(), "ParseError", "Function return types are required");
+            statement.inferReturnType = true;
         }
         if (!consume(TokenKind::Colon, "Expected ':' after function signature")) {
             synchronize();
@@ -269,15 +269,14 @@ namespace cmath::language::detail {
             return statement;
         }
 
-        if (!consume(TokenKind::Arrow, "Expected '->' after lambda parameters")) {
-            synchronize();
-            return statement;
-        }
+        if (match(TokenKind::Arrow)) {
+            statement.returnTypeSyntax = parseTypeSyntax();
 
-        statement.returnTypeSyntax = parseTypeSyntax();
-
-        if (statement.returnTypeSyntax.kind == TypeSyntax::Kind::Named) {
-            statement.returnType = statement.returnTypeSyntax.name;
+            if (statement.returnTypeSyntax.kind == TypeSyntax::Kind::Named) {
+                statement.returnType = statement.returnTypeSyntax.name;
+            }
+        } else {
+            statement.inferReturnType = true;
         }
 
         if (!consume(TokenKind::Colon, "Expected ':' after lambda signatures")) {
