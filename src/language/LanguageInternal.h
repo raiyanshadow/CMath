@@ -376,6 +376,7 @@ namespace cmath::language::detail {
         IRBlock body;
         SourceLocation location{};
         LanguageType returnTypeInfo = LanguageType::scalarType(ValueType::Error);
+        std::vector<std::size_t> quantifiedTypeVariables;
     };
 
     struct ProgramIR {
@@ -399,12 +400,13 @@ namespace cmath::language::detail {
                 ValueType type; 
                 bool mutableBinding;
                 LanguageType typeInfo;
+                std::vector<std::size_t> quantifiedTypeVariables;
 
                 SymbolInfo(ValueType valueType, bool mutableValue)
                     : type(valueType), mutableBinding(mutableValue), typeInfo(LanguageType::scalarType(valueType)) {}
                 
-                SymbolInfo(ValueType valueType, bool mutableValue, LanguageType descriptor)
-                : type(valueType), mutableBinding(mutableValue), typeInfo(std::move(descriptor)) {}
+                SymbolInfo(ValueType valueType, bool mutableValue, LanguageType descriptor, std::vector<std::size_t> quantified = {})
+                : type(valueType), mutableBinding(mutableValue), typeInfo(std::move(descriptor)), quantifiedTypeVariables(std::move(quantified)) {}
             };
 
             struct Scope {
@@ -415,10 +417,16 @@ namespace cmath::language::detail {
             struct FunctionSignature {
                 std::vector<ValueType> parameters; 
                 ValueType result = ValueType::Error;
-
                 std::vector<LanguageType> parameterTypes;
                 LanguageType resultType = LanguageType::scalarType(ValueType::Error);
+                std::vector<std::size_t> quantifiedTypeVariables;
             };
+
+            LanguageType instantiateTypeScheme(const LanguageType& type, const std::vector<std::size_t>& quantified);
+            std::vector<std::size_t> generalizeType(const LanguageType& type, const Scope& scope) const;
+            bool isNonExpansive(const ExprPtr& expression) const;
+            bool compatibleTypes(const LanguageType& actual, const LanguageType& expected, const SourceLocation& location, const std::string& context);
+            bool analyzingRecursiveGroup_ = false;
 
             std::unordered_map<std::size_t, LanguageType> typeSubstitutions_;
             std::size_t nextTypeVariableId_ = 0;

@@ -713,6 +713,194 @@ def invalid(flag: Boolean):
         );
     }
 },
+{
+    "Inferred function parameter types",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def double(value):
+    return value * 2
+
+print(double(21))
+)",
+            "42\n"
+        );
+    }
+},
+{
+    "Polymorphic inferred named function",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def identity(value):
+    return value
+
+print(identity(42))
+print(identity("hello"))
+print(identity(2.5))
+)",
+            "42\nhello\n5/2\n"
+        );
+    }
+},
+{
+    "Polymorphic let lambda",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+let identity = fn(value):
+    return value
+
+print(identity(42))
+print(identity("hello"))
+print(identity(2.5))
+)",
+            "42\nhello\n5/2\n"
+        );
+    }
+},
+{
+    "Polymorphic let alias",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def identity(value):
+    return value
+
+let copy = identity
+
+print(copy(10))
+print(copy("CMath"))
+)",
+            "10\nCMath\n"
+        );
+    }
+},
+{
+    "Inferred higher-order parameters",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def apply(function, value):
+    return function(value)
+
+def increment(value: Integer) -> Integer:
+    return value + 1
+
+print(apply(increment, 4))
+)",
+            "5\n"
+        );
+    }
+},
+{
+    "Inferred composition parameter types",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def compose(f, g, x):
+    return f(g(x))
+
+def increment(value: Integer) -> Integer:
+    return value + 1
+
+def identity(value):
+    return value
+
+print(compose(increment, identity, 5))
+)",
+            "6\n"
+        );
+    }
+},
+{
+    "Mutable lambda remains monomorphic",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+var identity = fn(value):
+    return value
+
+print(identity(10))
+print(identity("not an integer"))
+)"
+        );
+    }
+},
+{
+    "Expansive let initializer is not generalized",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def make_identity():
+    lambda identity = fn(value):
+        return value
+
+    return identity
+
+let identity = make_identity()
+
+print(identity(10))
+print(identity("not an integer"))
+)"
+        );
+    }
+},
+{
+    "Occurs check rejects self-application",
+    [] {
+        expectCompileFailure(
+            R"(
+domain Integer
+
+def self_apply(function):
+    return function(function)
+)"
+        );
+    }
+},
+{
+    "Inferred mutually recursive parameters",
+    [] {
+        expectOutput(
+            R"(
+domain Integer
+
+def even(n):
+    if n == 0:
+        return true
+    else:
+        return odd(n - 1)
+
+def odd(n):
+    if n == 0:
+        return false
+    else:
+        return even(n - 1)
+
+print(even(10))
+print(odd(9))
+)",
+            "true\ntrue\n"
+        );
+    }
+},
         {
             "Static division by zero",
             [] {

@@ -1,6 +1,9 @@
 #include "LanguageInternal.h"
 
 #include <cmath>
+
+#include <algorithm>
+#include <functional>
 #include <unordered_set>
 #include <utility>
 #include <iterator>
@@ -242,6 +245,122 @@ bool SemanticAnalyzer::containsTypeVariable(const LanguageType& originalType) co
     return type.result && containsTypeVariable(*type.result);
 }
 
+LanguageType SemanticAnalyzer::instantiateTypeScheme(const LanguageType& originalType, const std::vector<std::size_t>& quantified) {
+    const std::unordered_set<std::size_t> quantifiedSet(quantified.begin(), quantified.end());
+    std::unordered_map<std::size_t, LanguageType> replacements;
+    
+    std::function<LanguageType(const LanguageType&)> clone = 
+        [&](const LanguageType& original) -> LanguageType {
+            const LanguageType type = resolveTypeVariables(original);
+            if (type.kind == LanguageType::Kind::Scalar) return type;
+            if (type.kind == LanguageType::Kind::TypeVariable) {
+                if (!quantifiedSet.contains(type.variableId)) return type;
+                const auto found = replacements.find(type.variableId);
+                if (found != replacements.end()) return found->second;
+
+                LanguageType fresh = freshTypeVariable();
+                replacements.emplace(type.variableId, fresh);
+                return fresh;
+            }
+
+            std::vector<LanguageType> parameters;
+            parameters.reserve(type.parameters.size());
+
+            for (const auto& parameter : type.parameters) {
+                parameters.push_back(clone(parameter));
+            }
+
+            LanguageType result = type.result ? clone(*type.result) : LanguageType::scalarType(ValueType::Error);
+            
+            return LanguageType::functionType(std::move(parameters), std::move(result));
+        };
+
+    return clone(originalType);
+}
+
+std::vector<std::size_t> SemanticAnalyzer::generalizeType(const LanguageType& originalType, const Scope& scope) const {
+    using VariableSet = std::unordered_set<std::size_t>;
+    auto collect = [this](const LanguageType& root, VariableSet& variables) {
+        std::function<void(const LanguageType&)> visit =
+        [&](const LanguageType& original) {
+            const LanguageType type = resolveTypeVariables(original);
+            if (type.kind == LanguageType::Kind::TypeVariable) {
+                variables.insert(type.variableId);
+                return;
+            }
+
+            if (type.kind == LanguageType::Kind::Function) {
+                for (const auto& parameter : type.parameters) {
+                    visit(parameter);
+                }
+
+                if (type.result) visit(*type.result);
+            }
+        };
+
+        visit(root);
+    };
+
+    VariableSet candidates;
+    collect(originalType, candidates);
+
+    VariableSet environmentVariables;
+
+    for (const Scope* current = &scope; current != nullptr; current = current->parent) {
+        for (const auto& [name, symbol] : current->symbols) {
+            (void) name;
+
+            VariableSet symbolVariables;
+            collect(symbol.typeInfo, symbolVariables);
+
+            for (const auto quantified : symbol.quantifiedTypeVariables) {
+                symbolVariables.erase(quantified);
+            }
+
+            environmentVariables.insert(symbolVariables.begin(), symbolVariables.end());
+        }
+    }
+
+    for (const auto variable : environmentVariables) {
+        candidates.erase(variable);
+    }
+
+    std::vector<std::size_t> result(candidates.begin(), candidates.end());
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+bool SemanticAnalyzer::isNonExpansive(const ExprPtr& expression) const {
+    if (!expression) return false;
+    switch (expression->kind) {
+        case Expr::Kind::Number:
+        case Expr::Kind::String:
+        case Expr::Kind::Boolean:
+        case Expr::Kind::Identifier:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool SemanticAnalyzer::compatibleTypes(const LanguageType& actualOriginal, const LanguageType& expectedOriginal, const SourceLocation& location, const std::string& context) {
+    const LanguageType actual = resolveTypeVariables(actualOriginal);
+    const LanguageType expected = resolveTypeVariables(expectedOriginal);
+    if (containsTypeVariable(actual) || containsTypeVariable(expected)) {
+        return unifyTypes(actual, expected, location, context);
+    }
+
+    if (actual.kind == LanguageType::Kind::Scalar && expected.kind == LanguageType::Kind::Scalar) {
+        return canWiden(actual.scalar, expected.scalar);
+    }
+
+    if (actual == expected) {
+        return true;
+    }
+
+    return unifyTypes(actual, expected, location, context);
+}
+
 std::optional<ValueType> SemanticAnalyzer::resolveType(const std::string& name,
                                                         const SourceLocation& loc) {
     auto type = parseTypeName(name);
@@ -346,9 +465,16 @@ void SemanticAnalyzer::collectFunctions(const AstProgram& ast) {
             TypeSyntax syntax = parameter.typeSyntax;
 
             if (syntax.kind == TypeSyntax::Kind::Named && syntax.name.empty()) {
+                signature.parameterTypes.push_back(freshTypeVariable());
+                signature.parameters.push_back(ValueType::Error);
+                continue;
+            }
+
+            if (syntax.kind == TypeSyntax::Kind::Named && syntax.name.empty()) {
                 syntax.name = parameter.typeName;
                 syntax.location = parameter.location;
             }
+
             auto type = resolveType(syntax, parameter.location);
             if (!type) {
                 valid = false;
@@ -402,8 +528,10 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
         case Expr::Kind::Identifier: {
             const auto* symbol = findSymbol(scope, expression->text);
             if (symbol) {
-                auto result = makeIR(IRExpression::Kind::Variable, expression->text, symbol->type, expression->location);
-                result->typeInfo = symbol->typeInfo;
+                LanguageType instantiated = instantiateTypeScheme(symbol->typeInfo, symbol->quantifiedTypeVariables);
+                const ValueType scalar = instantiated.kind == LanguageType::Kind::Scalar ? instantiated.scalar : ValueType::Error;
+                auto result = makeIR(IRExpression::Kind::Variable, expression->text, scalar, expression->location);
+                result->typeInfo = std::move(instantiated);
                 return result;
             }
             const auto function = signatures_.find(expression->text);
@@ -415,8 +543,12 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
                     parameterTypes.push_back(parameterType);
                 }
 
+                LanguageType functionType = LanguageType::functionType(std::move(parameterTypes), function->second.resultType);
+                if (!analyzingRecursiveGroup_) {
+                    functionType = instantiateTypeScheme(functionType, function->second.quantifiedTypeVariables);
+                }
                 auto result = makeIR(IRExpression::Kind::Variable, expression->text, ValueType::Error, expression->location);
-                result->typeInfo = LanguageType::functionType(std::move(parameterTypes), function->second.resultType);
+                result->typeInfo = std::move(functionType);
                 return result;
             }
             if (expression->text == "pi" || expression->text == "e")
@@ -496,6 +628,97 @@ IRExprPtr SemanticAnalyzer::analyzeExpression(const ExprPtr& expression, const S
             auto left = analyzeExpression(expression->children[0], scope);
             auto right = analyzeExpression(expression->children[1], scope);
             const std::string& op = expression->text;
+            const ValueType defaultNumeric = parseTypeName(defaultDomain_).value_or(ValueType::Integer);
+            auto refresh = [this](const IRExprPtr& value) {
+                value->typeInfo = resolveTypeVariables(value->typeInfo);
+                value->type = value->typeInfo.kind == LanguageType::Kind::Scalar ? value->typeInfo.scalar : ValueType::Error;
+            };
+
+            auto constrainNumericPair = [&](bool integerOnly = false) {
+                LanguageType leftType = resolveTypeVariables(left->typeInfo);
+                LanguageType rightType = resolveTypeVariables(right->typeInfo);
+
+                if (op == "+" && 
+                    leftType.kind == LanguageType::Kind::TypeVariable && 
+                    rightType.kind == LanguageType::Kind::Scalar &&
+                    rightType.scalar == ValueType::String) {
+                        unifyTypes(leftType, LanguageType::scalarType(ValueType::String), expression->location, "string concatenation");
+                    }
+
+                if (op == "+" &&
+                    leftType.kind == LanguageType::Kind::TypeVariable &&
+                    rightType.kind == LanguageType::Kind::Scalar &&
+                    leftType.scalar == ValueType::String) {
+                        unifyTypes(rightType, LanguageType::scalarType(ValueType::String), expression->location, "string concatenation");
+                    }
+
+                leftType = resolveTypeVariables(left->typeInfo);
+                rightType = resolveTypeVariables(right->typeInfo);
+
+                if (leftType.kind == LanguageType::Kind::TypeVariable &&
+                    rightType.kind == LanguageType::Kind::TypeVariable) {
+                        unifyTypes(leftType, rightType, expression->location, "numeric operands");
+                    }
+                
+                leftType = resolveTypeVariables(left->typeInfo);
+                rightType = resolveTypeVariables(right->typeInfo);
+
+                if (leftType.kind == LanguageType::Kind::TypeVariable &&
+                    rightType.kind == LanguageType::Kind::Scalar &&
+                    isNumeric(rightType.scalar)) {
+                        unifyTypes(leftType, rightType, expression->location, "numeric operand");
+                    }
+
+                if (rightType.kind == LanguageType::Kind::TypeVariable &&
+                    leftType.kind == LanguageType::Kind::Scalar &&
+                    isNumeric(leftType.scalar)) {
+                        unifyTypes(rightType, leftType, expression->location, "numeric operands");
+                    }
+
+                const ValueType fallback = integerOnly ? ValueType::Error : defaultNumeric;
+
+                leftType = resolveTypeVariables(left->typeInfo);
+                rightType = resolveTypeVariables(right->typeInfo);
+
+                if (leftType.kind == LanguageType::Kind::TypeVariable) {
+                    unifyTypes(leftType, LanguageType::scalarType(fallback), expression->location, "numeric operand");
+                }
+
+                if (rightType.kind == LanguageType::Kind::TypeVariable) {
+                    unifyTypes(rightType, LanguageType::scalarType(fallback), expression->location, "numeric operand");
+                }
+
+                refresh(left);
+                refresh(right);
+            };
+
+            if (op == "+" || op == "-" || op == "*" ||
+                op == "/" || op == "^" || op == "%") {
+                    constrainNumericPair(op == "%");
+            } else if (op == "and" || op == "or") {
+                for (auto& operand : {left, right}) {
+                    const LanguageType type = resolveTypeVariables(operand->typeInfo);
+
+                    if (type.kind == LanguageType::Kind::TypeVariable) {
+                        unifyTypes(type, LanguageType::scalarType(ValueType::Boolean), expression->location, "logical operand");
+                    }
+
+                    refresh(operand);
+                }
+            } else if (op == "==" || op == "!=") {
+                const LanguageType leftType = resolveTypeVariables(left->typeInfo);
+                const LanguageType rightType = resolveTypeVariables(right->typeInfo);
+
+                if (leftType.kind == LanguageType::Kind::TypeVariable || rightType.kind == LanguageType::Kind::TypeVariable) {
+                    unifyTypes(leftType, rightType, expression->location, "equality operands");
+                }
+
+                refresh(left);
+                refresh(right);
+            } else {
+                constrainNumericPair();
+            }
+
             ValueType result = ValueType::Error;
             if (op == "/") {
                 const auto constantDenominator = constantReal(expression->children[1]);
@@ -575,25 +798,30 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
     for (std::size_t i = 1; i < expression->children.size(); ++i)
         arguments.push_back(analyzeExpression(expression->children[i], scope));
 
-    auto compatible = [](const LanguageType& actual, const LanguageType& expected) -> bool {
-        if (expected.kind == LanguageType::Kind::Function) {
-            return actual == expected;
-        }
-
-        return actual.kind == LanguageType::Kind::Scalar && canWiden(actual.scalar, expected.scalar);
+    auto compatible = [this](const LanguageType& actual, const LanguageType& expected, const SourceLocation& location, const std::string& context) {
+        return compatibleTypes(actual, expected, location, context);
     };
 
     if (const auto* symbol = findSymbol(scope, name)) {
-        if (!symbol->typeInfo.isFunction()) {
-            error(expression->location, "TypeError", "Value '" + name + "' is not callable");
-            result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
-            return ValueType::Error;
+        auto callee = analyzeExpression(expression->children.front(), scope);
+        LanguageType signature = resolveTypeVariables(callee->typeInfo);
+        
+        if (signature.kind == LanguageType::Kind::TypeVariable) {
+            std::vector<LanguageType> parameterTypes;
+            parameterTypes.reserve(arguments.size());
+
+            for (std::size_t i = 0; i < arguments.size(); ++i) {
+                parameterTypes.push_back(freshTypeVariable());
+            }
+
+            LanguageType returnType = freshTypeVariable();
+            const LanguageType inferredFunction = LanguageType::functionType(std::move(parameterTypes), returnType);
+            unifyTypes(signature, inferredFunction, expression->location, "function parameter '" + name + "'");
+            signature = resolveTypeVariables(callee->typeInfo);
         }
 
-        const auto& signature = symbol->typeInfo;
-
-        if (!signature.result) {
-            error(expression->location, "TypeError", "Function value '" + name + "' has an incomplete signature");
+        if (signature.kind != LanguageType::Kind::Function || !signature.result) {
+            error(expression->location, "TypeError", "Value '" + name + "' is not callable");
             result = makeIR(IRExpression::Kind::Call, name, ValueType::Error, expression->location);
             return ValueType::Error;
         }
@@ -602,16 +830,15 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
             error(expression->location, "TypeError", "Function value '" + name + "' expects " + std::to_string(signature.parameters.size()) + " argument(s), but received " + std::to_string(arguments.size()));
         } else {
             for (std::size_t i = 0; i < arguments.size(); ++i) {
-                const auto& expected = signature.parameters[i];
-                if (!compatible(arguments[i]->typeInfo, expected)) {
-                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i+1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) + "; expected " + typeName(expected));
+                if (!compatible(arguments[i]->typeInfo, signature.parameters[i], arguments[i]->location, "argument to '" + name + "'")) {
+                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i+1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) + "; expected " + typeName(signature.parameters[i]));
                 }
             }
         }
 
         std::vector<IRExprPtr> callChildren;
 
-        callChildren.push_back(analyzeExpression(expression->children.front(), scope));
+        callChildren.push_back(std::move(callee));
         callChildren.insert(callChildren.end(), arguments.begin(), arguments.end());
         const LanguageType resultInfo = resolveTypeVariables(*signature.result);
         const ValueType resultType = resultInfo.kind == LanguageType::Kind::Scalar ? resultInfo.scalar : ValueType::Error;
@@ -624,18 +851,24 @@ std::optional<ValueType> SemanticAnalyzer::analyzeCall(const ExprPtr& expression
     }
 
     if (const auto function = signatures_.find(name); function != signatures_.end()) {
+        LanguageType signature = LanguageType::functionType(function->second.parameterTypes, function->second.resultType);
+        if (!analyzingRecursiveGroup_) {
+            signature = instantiateTypeScheme(signature, function->second.quantifiedTypeVariables);
+        }
+
+        signature = resolveTypeVariables(signature);
+        
         if (arguments.size() != function->second.parameters.size()) {
             error(expression->location, "RuntimeError", "Function '" + name + "' received the wrong number of arguments");
         } else {
             for (std::size_t i = 0; i < arguments.size(); i++) {
-                const auto& expected = function->second.parameterTypes[i];
-                if (!compatible(arguments[i]->typeInfo, expected)) {
-                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i + 1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) +"; expected " + typeName(expected));
+                if (!compatible(arguments[i]->typeInfo, signature.parameters[i], arguments[i]->location, "argument to '" + name + "'")) {
+                    error(arguments[i]->location, "TypeError", "Argument " + std::to_string(i + 1) + " of '" + name + "' has type " + typeName(arguments[i]->typeInfo) +"; expected " + typeName(signature.parameters[i]));
                 }
             }
         }
 
-        const LanguageType resultInfo = resolveTypeVariables(function->second.resultType);
+        const LanguageType resultInfo = signature.result ? resolveTypeVariables(*signature.result) : LanguageType::scalarType(ValueType::Error);
         const ValueType resultType = resultInfo.kind == LanguageType::Kind::Scalar ? resultInfo.scalar : ValueType::Error;
 
         result = makeIR(IRExpression::Kind::Call, name, resultType, expression->location, std::move(arguments));
@@ -738,41 +971,34 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                 auto initializer = analyzeExpression(statement.expression, scope);
                 ValueType declared = initializer->type;
                 LanguageType declaredInfo = initializer->typeInfo;
-
                 const bool hasExplicitType = !statement.typeName.empty() || statement.typeSyntax.kind == TypeSyntax::Kind::Function || !statement.typeSyntax.name.empty();
 
                 if (hasExplicitType) {
                     TypeSyntax syntax = statement.typeSyntax;
-
                     if (syntax.kind == TypeSyntax::Kind::Named && syntax.name.empty()) {
                         syntax.name = statement.typeName;
                         syntax.location = statement.location;
                     }
 
                     auto explicitType = resolveType(syntax, statement.location);
-
                     if (explicitType) {
-                        declaredInfo = *explicitType;
-                        if (explicitType->kind == LanguageType::Kind::Scalar) {
-                            declared = explicitType->scalar;
-
-                            if (initializer->typeInfo.kind != LanguageType::Kind::Scalar) {
-                                error(statement.expression ? statement.expression->location : statement.location, "TypeError", "Cannot assign " + typeName(initializer->typeInfo) + " to " + typeName(declaredInfo));
-                            } else if (!canWiden(initializer->type, declared)) {
-                                error(statement.expression ? statement.expression->location : statement.location, "TypeError", "Cannot assign " + typeName(initializer->typeInfo) + " to " + typeName(declaredInfo));
-                            }
-                        } else {
-                            declared = ValueType::Error;
-
-                            if (initializer->typeInfo != *explicitType) {
-                                error(statement.expression ? statement.expression->location : statement.location, "TypeError", "Cannot assign " + typeName(initializer->typeInfo) + " to " + typeName(*explicitType));
-                            }
+                        if (!compatibleTypes(initializer->typeInfo, *explicitType, statement.location, "variable initializer")) {
+                            error(statement.expression ? statement.expression->location : statement.location, "TypeError", "Cannot assign " + typeName(initializer->typeInfo) + " to " + typeName(*explicitType));
                         }
+
+                        declaredInfo = *explicitType;
+                        declared = explicitType->kind == LanguageType::Kind::Scalar ? explicitType->scalar : ValueType::Error;
                     }
                 }
 
+                std::vector<std::size_t> quantified;
+
+                if (!statement.mutableBinding && isNonExpansive(statement.expression)) {
+                    quantified = generalizeType(declaredInfo, scope);
+                }
+
                 if (!scope.symbols.contains(statement.name)) {
-                    scope.symbols.emplace(statement.name, SymbolInfo(declared, statement.mutableBinding, declaredInfo));
+                    scope.symbols.emplace(statement.name, SymbolInfo{declared, statement.mutableBinding, declaredInfo, std::move(quantified)});
                 }
 
                 IRDeclaration declaration;
@@ -823,30 +1049,29 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                     }
 
                     TypeSyntax syntax = parameter.typeSyntax;
+                    LanguageType resolvedType;
 
                     if (syntax.kind == TypeSyntax::Kind::Named && syntax.name.empty()) {
-                        syntax.name = parameter.typeName;
-                        syntax.location = parameter.location;
+                        resolvedType = freshTypeVariable();
+                    } else {
+                        if (syntax.kind == TypeSyntax::Kind::Named && syntax.name.empty()) {
+                            syntax.name = parameter.typeName;
+                            syntax.location = parameter.location;
+                        }
+                        auto resolved = resolveType(syntax, parameter.location);
+                        if (!resolved) {
+                            valid = false; 
+                            continue;
+                        }
+
+                        resolvedType = std::move(*resolved);
                     }
 
-                    auto resolved = resolveType(syntax, parameter.location);
+                    const ValueType scalarType = resolvedType.kind == LanguageType::Kind::Scalar ? resolvedType.scalar : ValueType::Error;
+                    parameterTypes.push_back(resolvedType);
 
-                    if (!resolved) {
-                        valid = false;
-                        continue;
-                    }
-
-                    const ValueType scalarType = resolved->kind == LanguageType::Kind::Scalar ? resolved->scalar : ValueType::Error;
-                    parameterTypes.push_back(*resolved);
-
-                    function->parameters.push_back(IRParameter{parameter.name, scalarType, *resolved});
-
-                    if (!allowShadowing_ && functionScope.parent && findSymbol(*functionScope.parent, parameter.name)) {
-                        error(parameter.location, "NameError", "Lambda parameter '" + parameter.name + "' shadows an existing name");
-                        valid = false;
-                    }
-
-                    functionScope.symbols.emplace(parameter.name, SymbolInfo{scalarType, false, *resolved});
+                    function->parameters.push_back(IRParameter{parameter.name, scalarType, resolvedType});
+                    functionScope.symbols.emplace(parameter.name, SymbolInfo{scalarType, false, resolvedType});
                 }
 
                 LanguageType lambdaReturnType = statement.inferReturnType ? freshTypeVariable() : LanguageType::scalarType(ValueType::Error);
@@ -892,10 +1117,17 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                 }
 
                 LanguageType lambdaType = LanguageType::functionType(std::move(parameterTypes), lambdaReturnType);
+                std::vector<std::size_t> quantified;
+
+                if (!statement.mutableBinding) {
+                    quantified = generalizeType(lambdaType, scope);
+                }
+
+                function->quantifiedTypeVariables = quantified;
 
                 if (valid) {
                     scope.symbols.emplace(
-                        statement.name, SymbolInfo{ValueType::Error, false, lambdaType}
+                        statement.name, SymbolInfo{ValueType::Error, statement.mutableBinding, lambdaType, std::move(quantified)}
                     );
                 }
 
@@ -903,7 +1135,7 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                 declaration.name = statement.name;
                 declaration.type = ValueType::Error;
                 declaration.typeInfo = std::move(lambdaType);
-                declaration.mutableBinding = false;
+                declaration.mutableBinding = statement.mutableBinding;
                 declaration.lambdaFunction = std::move(function);
 
                 append(std::move(declaration), statement.location);
@@ -944,7 +1176,7 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
 
                 auto value = analyzeExpression(valueExpression, scope);
 
-                const bool compatible = symbol->typeInfo.kind == LanguageType::Kind::Function ? value->typeInfo == symbol->typeInfo : value->typeInfo.kind == LanguageType::Kind::Scalar && canWiden(value->type, symbol->type);
+                const bool compatible = compatibleTypes(value->typeInfo, symbol->typeInfo, statement.location, "assigned to '" + statement.name + "'");
 
                 if (!compatible) {
                     error(statement.location, "TypeError", "Cannot assign " + typeName(value->typeInfo) + " to variable '" + statement.name + "' of type " + typeName(symbol->typeInfo));
@@ -995,7 +1227,7 @@ IRBlock SemanticAnalyzer::analyzeBlock(const AstBlock& block, Scope& scope, bool
                     error(statement.location, "TypeError", "A function returning " + typeName(returnType) + " must return a value");
                 } else {
                     returnStatement.expression = analyzeExpression(statement.expression, scope);
-                    const bool compatible = returnType.kind == LanguageType::Kind::Function ? returnStatement.expression->typeInfo == returnType : returnStatement.expression->typeInfo.kind == LanguageType::Kind::Scalar && canWiden(returnStatement.expression->type, returnType.scalar);
+                    const bool compatible = compatibleTypes(returnStatement.expression->typeInfo, returnType, statement.expression->location, "function return value");
                     if (!compatible) {
                         error(statement.expression->location, "TypeError", "Function returns " + typeName(returnStatement.expression->typeInfo) + "; declared return type is " + typeName(returnType));
                     }
@@ -1226,6 +1458,23 @@ SemanticResult SemanticAnalyzer::analyze(const AstProgram& ast) {
               "'. Supported domains: Integer, Rational, Real, Complex");
 
     collectFunctions(ast);
+    const std::size_t functionCount = static_cast<std::size_t>(
+        std::count_if(ast.body.statements.begin(), ast.body.statements.end(), [](const Statement& statement) {return statement.kind == Statement::Kind::Function;})
+    );
+    std::size_t analyzedFunctionCount = 0;
+    analyzingRecursiveGroup_ = functionCount != 0;
+    auto finishRecursiveGroup = [&]() {
+        for (auto& [name, signature] : signatures_) {
+            (void)name;
+            LanguageType functionType = LanguageType::functionType(signature.parameterTypes, signature.resultType);
+            signature.quantifiedTypeVariables = generalizeType(functionType, globals_);
+            const auto function = functions_.find(name);
+            if (function != functions_.end()) {
+                function->second.quantifiedTypeVariables = signature.quantifiedTypeVariables;
+            }
+        }
+        analyzingRecursiveGroup_ = false;
+    };
     auto program = std::make_shared<ProgramIR>();
     program->defaultDomain = defaultDomain_;
 
@@ -1234,6 +1483,10 @@ SemanticResult SemanticAnalyzer::analyze(const AstProgram& ast) {
     for (const auto& statement : ast.body.statements) {
         if (statement.kind == Statement::Kind::Function) {
             analyzeFunction(statement);
+            ++analyzedFunctionCount;
+            if (analyzedFunctionCount == functionCount) {
+                finishRecursiveGroup();
+            }
             continue;
         }
         AstBlock singleStatement;
@@ -1247,6 +1500,9 @@ SemanticResult SemanticAnalyzer::analyze(const AstProgram& ast) {
 
     for (auto& [name, function] : functions_) {
         (void)name;
+        if (analyzingRecursiveGroup_) {
+            finishRecursiveGroup();
+        }
         resolveIRFunctionTypes(function);
     }
 
@@ -1316,20 +1572,72 @@ void SemanticAnalyzer::resolveIRBlockTypes(IRBlock& block) {
 }
 
 void SemanticAnalyzer::resolveIRFunctionTypes(IRFunction& function) {
-    for (auto& parameter : function.parameters) {
-        parameter.typeInfo = resolveTypeVariables(parameter.typeInfo);
-        parameter.type = parameter.typeInfo.kind == LanguageType::Kind::Scalar ? parameter.typeInfo.scalar : ValueType::Error;
+    const std::unordered_set<std::size_t> quantified(function.quantifiedTypeVariables.begin(), function.quantifiedTypeVariables.end());
+    auto hasUnquantifiedTypeVariable =
+        [this, &quantified](const LanguageType& original) {
+            const LanguageType type = resolveTypeVariables(original);
 
-        if (containsTypeVariable(parameter.typeInfo)) {
-            error(function.location, "TypeInferenceError", "Could not infer the type of parameter '" + parameter.name + "' in function '" + function.name + "'");
+            auto visit = [&](const auto& self,
+                             const LanguageType& current) -> bool {
+                if (current.kind == LanguageType::Kind::TypeVariable) {
+                    return !quantified.contains(current.variableId);
+                }
+
+                if (current.kind == LanguageType::Kind::Scalar) {
+                    return false;
+                }
+
+                for (const auto& parameter : current.parameters) {
+                    if (self(self, parameter)) {
+                        return true;
+                    }
+                }
+
+                return current.result &&
+                       self(self, *current.result);
+            };
+
+            return visit(visit, type);
+        };
+
+    for (auto& parameter : function.parameters) {
+        parameter.typeInfo =
+            resolveTypeVariables(parameter.typeInfo);
+
+        parameter.type =
+            parameter.typeInfo.kind == LanguageType::Kind::Scalar
+                ? parameter.typeInfo.scalar
+                : ValueType::Error;
+
+        // Generalized variables are valid. Ungeneralized variables
+        // indicate that inference did not determine a usable type.
+        if (hasUnquantifiedTypeVariable(parameter.typeInfo)) {
+            error(
+                function.location,
+                "TypeInferenceError",
+                "Could not infer the type of parameter '" +
+                parameter.name + "' in function '" +
+                function.name + "'"
+            );
         }
     }
 
-    function.returnTypeInfo = resolveTypeVariables(function.returnTypeInfo);
-    function.returnType = function.returnTypeInfo.kind == LanguageType::Kind::Scalar ? function.returnTypeInfo.scalar : ValueType::Error;
+    function.returnTypeInfo =
+        resolveTypeVariables(function.returnTypeInfo);
 
-    if (containsTypeVariable(function.returnTypeInfo)) {
-        error(function.location, "TypeInferenceError", "Could not infer the return type of '" + function.name + "'. Add an explicit return type annotation");
+    function.returnType =
+        function.returnTypeInfo.kind == LanguageType::Kind::Scalar
+            ? function.returnTypeInfo.scalar
+            : ValueType::Error;
+
+    if (hasUnquantifiedTypeVariable(function.returnTypeInfo)) {
+        error(
+            function.location,
+            "TypeInferenceError",
+            "Could not infer the return type of '" +
+            function.name +
+            "'. Add an explicit return type annotation"
+        );
     }
 
     resolveIRBlockTypes(function.body);

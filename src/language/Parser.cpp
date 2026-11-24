@@ -115,7 +115,10 @@ namespace cmath::language::detail {
     Statement Parser::parseVariable() {
         const Token keyword = advance();
         const Token name = peek();
-        if (!consume(TokenKind::Identifier, "Expected variable name")) synchronize();
+        if (!consume(TokenKind::Identifier, "Expected variable name")) {
+            synchronize();
+            return {};
+        }
         Statement statement;
         statement.kind = Statement::Kind::Variable;
         statement.location = keyword.location;
@@ -128,7 +131,71 @@ namespace cmath::language::detail {
                 statement.typeName = statement.typeSyntax.name;
             }
         }
-        if (!consume(TokenKind::Equal, "Expected '=' in variable declaration")) synchronize();
+        if (!consume(TokenKind::Equal, "Expected '=' in variable declaration")) {
+            synchronize();
+            return statement;
+        }
+
+        if (match(TokenKind::Fn)) {
+            Statement lambda;
+            lambda.kind = Statement::Kind::Lambda;
+            lambda.location = keyword.location;
+            lambda.name = name.lexeme;
+            lambda.mutableBinding = statement.mutableBinding;
+            lambda.typeSyntax = statement.typeSyntax;
+
+            if (!consume(TokenKind::LeftParen, "Expecteed '(' after 'fn'")) {
+                synchronize();
+                return lambda;
+            }
+
+            if (!check(TokenKind::RightParen)) {
+                do {
+                    const Token parameterName = peek();
+                    if (!consume(TokenKind::Identifier, "Expected lambda parameter name")) {
+                        synchronize();
+                        return lambda;
+                    }
+
+                    ParameterAst parameter;
+                    parameter.name = parameterName.lexeme;
+                    parameter.location = parameterName.location;
+
+                    if (match(TokenKind::Colon)) {
+                        parameter.typeSyntax = parseTypeSyntax();
+                        if (parameter.typeSyntax.kind == TypeSyntax::Kind::Named) {
+                            parameter.typeName = parameter.typeSyntax.name;
+                        }
+                    } else {
+                        parameter.typeSyntax.location = parameterName.location;
+                    }
+                    lambda.parameters.push_back(std::move(parameter));
+                } while (match(TokenKind::Comma));
+            }
+
+            if (!consume(TokenKind::RightParen, "Expected ')' after lambda parameters")) {
+                synchronize();
+                return lambda;    
+            }
+
+            if (match(TokenKind::Arrow)) {
+                lambda.returnTypeSyntax = parseTypeSyntax();
+                if (lambda.returnTypeSyntax.kind == TypeSyntax::Kind::Named) {
+                    lambda.returnType = lambda.returnTypeSyntax.name;
+                }
+            } else {
+                lambda.inferReturnType = true;
+            }
+
+            if (!consume(TokenKind::Colon, "Expected ':' after lambda signature")) {
+                synchronize();
+                return lambda;
+            }
+
+            lambda.body = parseIndentedBlock();
+            return lambda;
+        }
+
         statement.expression = parseExpression();
         if (!check(TokenKind::Newline) && !check(TokenKind::Dedent) && !check(TokenKind::EndOfFile)) 
             error(peek(), "ParseError", "Unexpected token after variable initializer");
@@ -164,15 +231,16 @@ namespace cmath::language::detail {
                     synchronize();
                     return statement;
                 }
-                if (!consume(TokenKind::Colon, "Function parameters require type annotations")) {
-                    synchronize();
-                    return statement;
-                }
 
                 ParameterAst parameter;
                 parameter.name = parameterName.lexeme;
                 parameter.location = parameterName.location;
-                parameter.typeSyntax = parseTypeSyntax();
+
+                if (match(TokenKind::Colon)) {
+                    parameter.typeSyntax = parseTypeSyntax();
+                } else {
+                    parameter.typeSyntax.location = parameterName.location;
+                }
 
                 if (parameter.typeSyntax.kind == TypeSyntax::Kind::Named) {
                     parameter.typeName = parameter.typeSyntax.name;
@@ -246,15 +314,15 @@ namespace cmath::language::detail {
                     return statement;
                 }
 
-                if (!consume(TokenKind::Colon, "Lambda parameters require type annotations")) {
-                    synchronize();
-                    return statement;
-                }
-
                 ParameterAst parameter;
                 parameter.name = parameterName.lexeme;
                 parameter.location = parameterName.location;
-                parameter.typeSyntax = parseTypeSyntax();
+                
+                if (match(TokenKind::Colon)) {
+                    parameter.typeSyntax = parseTypeSyntax();
+                } else {
+                    parameter.typeSyntax.location = parameterName.location;
+                }
 
                 if (parameter.typeSyntax.kind == TypeSyntax::Kind::Named) {
                     parameter.typeName = parameter.typeSyntax.name;

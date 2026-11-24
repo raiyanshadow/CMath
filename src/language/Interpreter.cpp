@@ -19,6 +19,51 @@ namespace cmath::language::detail {
             std::string diagnosticCode;
         };
 
+        bool hasUnresolvedTypeVariable(const LanguageType& type) {
+            if (type.kind == LanguageType::Kind::TypeVariable) {
+                return true;
+            }
+
+            if (type.kind == LanguageType::Kind::Function) {
+                for (const auto& parameter : type.parameters) {
+                    if (hasUnresolvedTypeVariable(parameter)) return true;
+                }
+
+                return type.result && hasUnresolvedTypeVariable(*type.result);
+            }
+
+            return false;
+        }
+
+        bool runtimePayloadMatches(const RuntimeValue& value) {
+            if (value.typeInfo.isFunction()) {
+                return std::holds_alternative<std::shared_ptr<RuntimeCallable>>(
+                    value.data
+                );
+            }
+
+            switch (value.type) {
+                case ValueType::Integer:
+                    return std::holds_alternative<std::int64_t>(value.data);
+                case ValueType::Rational:
+                    return std::holds_alternative<RationalValue>(value.data);
+                case ValueType::Real:
+                    return std::holds_alternative<double>(value.data);
+                case ValueType::Complex:
+                    return std::holds_alternative<std::complex<double>>(value.data);
+                case ValueType::Boolean:
+                    return std::holds_alternative<bool>(value.data);
+                case ValueType::String:
+                    return std::holds_alternative<std::string>(value.data);
+                case ValueType::Unit:
+                    return std::holds_alternative<std::monostate>(value.data);
+                case ValueType::Error:
+                    return true;
+            }
+
+            return false;
+        }
+
         bool checkedAdd(std::int64_t a, std::int64_t b, std::int64_t& out) {
             if ((b > 0 && a > std::numeric_limits<std::int64_t>::max() - b) || 
                 (b < 0 && a < std::numeric_limits<std::int64_t>::min() - b)) return false;
@@ -185,33 +230,134 @@ namespace cmath::language::detail {
         return true;
     }
 
-    RuntimeValue Interpreter::promote(const RuntimeValue& value, ValueType target, const SourceLocation& location) {
-        if (value.type == target) return value;
-        if (!isNumeric(value.type) || !canWiden(value.type, target)) 
-            throw RuntimeFault(location, "RuntimeError", "Invalid runtime conversion from " + typeName(value.typeInfo) + " to " + typeName(target) + ".");
+    RuntimeValue Interpreter::promote(
+    const RuntimeValue& value,
+    ValueType target,
+    const SourceLocation& location
+    ) {
+        // Validate the payload BEFORE the same-type early return.
+        bool payloadMatches = false;
+
+        switch (value.type) {
+            case ValueType::Integer:
+                payloadMatches = std::holds_alternative<std::int64_t>(value.data);
+                break;
+            case ValueType::Rational:
+                payloadMatches = std::holds_alternative<RationalValue>(value.data);
+                break;
+            case ValueType::Real:
+                payloadMatches = std::holds_alternative<double>(value.data);
+                break;
+            case ValueType::Complex:
+                payloadMatches = std::holds_alternative<std::complex<double>>(value.data);
+                break;
+            case ValueType::Boolean:
+                payloadMatches = std::holds_alternative<bool>(value.data);
+                break;
+            case ValueType::String:
+                payloadMatches = std::holds_alternative<std::string>(value.data);
+                break;
+            case ValueType::Unit:
+                payloadMatches = std::holds_alternative<std::monostate>(value.data);
+                break;
+            case ValueType::Error:
+                payloadMatches = true;
+                break;
+        }
+
+        if (!payloadMatches) {
+            throw RuntimeFault(
+                location,
+                "InternalTypeError",
+                "Runtime payload mismatch: type=" +
+                typeName(value.type) +
+                ", variant index=" +
+                std::to_string(value.data.index())
+            );
+        }
+
+        if (value.type == target) {
+            return value;
+        }
+
+        if (!isNumeric(value.type) || !canWiden(value.type, target)) {
+            throw RuntimeFault(
+                location,
+                "RuntimeError",
+                "Invalid runtime conversion from " +
+                typeName(value.typeInfo) + " to " +
+                typeName(target)
+            );
+        }
+
         if (target == ValueType::Rational) {
-            if (value.type == ValueType::Integer) 
-                return {target, RationalValue{std::get<std::int64_t>(value.data), 1}};
+            if (value.type == ValueType::Integer) {
+                return {
+                    target,
+                    RationalValue{std::get<std::int64_t>(value.data), 1}
+                };
+            }
         }
+
         if (target == ValueType::Real) {
-            if (value.type == ValueType::Integer)
-                return {target, static_cast<double>(std::get<std::int64_t>(value.data))};
+            if (value.type == ValueType::Integer) {
+                return {
+                    target,
+                    static_cast<double>(std::get<std::int64_t>(value.data))
+                };
+            }
+
             if (value.type == ValueType::Rational) {
                 const auto r = std::get<RationalValue>(value.data);
-                return {target, static_cast<double>(r.numerator) / static_cast<double>(r.denominator)};
+
+                return {
+                    target,
+                    static_cast<double>(r.numerator) /
+                    static_cast<double>(r.denominator)
+                };
             }
         }
+
         if (target == ValueType::Complex) {
-            if (value.type == ValueType::Integer) 
-                return {target, std::complex<double>(static_cast<double>(std::get<std::int64_t>(value.data)), 0)};
+            if (value.type == ValueType::Integer) {
+                return {
+                    target,
+                    std::complex<double>(
+                        static_cast<double>(std::get<std::int64_t>(value.data)),
+                        0
+                    )
+                };
+            }
+
             if (value.type == ValueType::Rational) {
                 const auto r = std::get<RationalValue>(value.data);
-                return {target, std::complex<double>(static_cast<double>(r.numerator) / static_cast<double>(r.denominator), 0)};
+
+                return {
+                    target,
+                    std::complex<double>(
+                        static_cast<double>(r.numerator) /
+                        static_cast<double>(r.denominator),
+                        0
+                    )
+                };
             }
-            if (value.type == ValueType::Real) 
-                return {target, std::complex<double>(std::get<double>(value.data), 0)};
+
+            if (value.type == ValueType::Real) {
+                return {
+                    target,
+                    std::complex<double>(
+                        std::get<double>(value.data),
+                        0
+                    )
+                };
+            }
         }
-        throw RuntimeFault(location, "RuntimeError", "Unsupported runtime conversion");
+
+        throw RuntimeFault(
+            location,
+            "RuntimeError",
+            "Unsupported runtime conversion"
+        );
     }
 
     std::string Interpreter::format(const RuntimeValue& value) const {
@@ -226,9 +372,14 @@ namespace cmath::language::detail {
                 if (r.denominator == 1) return std::to_string(r.numerator);
                 return std::to_string(r.numerator) + "/" + std::to_string(r.denominator);
             }
-            case ValueType::Real:
-                stream << std::setprecision(15) << std::get<double>(value.data);
+            case ValueType::Real: {
+                const auto* real = std::get_if<double>(&value.data);
+                if (!real) {
+                    throw std::runtime_error("Real payload mismatch in format() : variant index="+std::to_string(value.data.index()) + ", typeInfo=" + typeName(value.typeInfo));
+                }
+                stream << std::setprecision(15) << *real;
                 return stream.str();
+            }
             case ValueType::Complex: {
                 const auto z = std::get<std::complex<double>>(value.data);
                 stream << std::setprecision(15) << z.real();
@@ -772,16 +923,63 @@ namespace cmath::language::detail {
         }
 
         if (resultType == ValueType::Real) {
-            const double a = std::get<double>(promote(leftValue, ValueType::Real, location).data);
-            const double b = std::get<double>(promote(rightValue, ValueType::Real, location).data);
-            if (op == "/" && b == 0.0) throw RuntimeFault(location, "RuntimeError", "Division by zero");
-            double result = 0;
+            const RuntimeValue promotedLeft =
+                promote(leftValue, ValueType::Real, location);
+
+            const RuntimeValue promotedRight =
+                promote(rightValue, ValueType::Real, location);
+
+            const auto* leftReal =
+                std::get_if<double>(&promotedLeft.data);
+
+            const auto* rightReal =
+                std::get_if<double>(&promotedRight.data);
+
+            if (!leftReal || !rightReal) {
+                throw RuntimeFault(
+                    location,
+                    "InternalTypeError",
+                    "Real arithmetic received invalid promoted values. "
+                    "Left: type=" + typeName(promotedLeft.type) +
+                    ", variant=" + std::to_string(promotedLeft.data.index()) +
+                    "; Right: type=" + typeName(promotedRight.type) +
+                    ", variant=" + std::to_string(promotedRight.data.index())
+                );
+            }
+
+            const double a = *leftReal;
+            const double b = *rightReal;
+
+            if (op == "/" && b == 0.0) {
+                throw RuntimeFault(
+                    location,
+                    "RuntimeError",
+                    "Division by zero"
+                );
+            }
+
+            double result = 0.0;
+
             if (op == "+") result = a + b;
             else if (op == "-") result = a - b;
             else if (op == "*") result = a * b;
             else if (op == "/") result = a / b;
-            else throw RuntimeFault(location, "RuntimeError", "Unsupported real operation");
-            if (!std::isfinite(result)) throw RuntimeFault(location, "RuntimeError", "Real arithmetic produced a non-finite value");
+            else {
+                throw RuntimeFault(
+                    location,
+                    "RuntimeError",
+                    "Unsupported real operation"
+                );
+            }
+
+            if (!std::isfinite(result)) {
+                throw RuntimeFault(
+                    location,
+                    "RuntimeError",
+                    "Real arithmetic produced a non-finite value"
+                );
+            }
+
             return {ValueType::Real, result};
         }
 
@@ -945,11 +1143,13 @@ namespace cmath::language::detail {
             const auto& parameter = function.parameters[i];
             RuntimeValue value = arguments[i];
 
+            const bool polymorphic = hasUnresolvedTypeVariable(parameter.typeInfo);
+
             if (parameter.typeInfo.isFunction()) {
-                if (value.typeInfo != parameter.typeInfo) {
+                if (!polymorphic && value.typeInfo != parameter.typeInfo) {
                     throw RuntimeFault(location, "TypeError", "Argument '" + parameter.name + "' has type " + typeName(value.typeInfo) + "; expected " + typeName(parameter.typeInfo)); 
                 }
-            } else {
+            } else if (!polymorphic && parameter.type != ValueType::Error) {
                 value = promote(value, parameter.type, location);
             }
 
@@ -989,6 +1189,7 @@ namespace cmath::language::detail {
 
                     if constexpr(std::is_same_v<T, IRDeclaration>) {
                         RuntimeValue value;
+                        const bool polymorphic = hasUnresolvedTypeVariable(node.typeInfo);
                         if (node.lambdaFunction) {
                             auto callable = std::make_shared<RuntimeCallable>();
                             callable->function = node.lambdaFunction;
@@ -1004,7 +1205,7 @@ namespace cmath::language::detail {
                             if (value.typeInfo != node.typeInfo) {
                                 throw RuntimeFault(statement.location, "TypeError", "Cannot initialize '" + node.name + "' with " + typeName(value.typeInfo) + "; expects " + typeName(node.typeInfo));
                             }
-                        } else {
+                        } else if (!polymorphic && node.type != ValueType::Error) {
                             value = promote(value, node.type, statement.location);
                         }
 
@@ -1014,12 +1215,13 @@ namespace cmath::language::detail {
                         return {};
                     } else if constexpr(std::is_same_v<T, IRAssignment>) {
                         auto value = evaluate(node.expression, environment);
+                        const bool polymorphic = hasUnresolvedTypeVariable(node.typeInfo);
                         if (!diagnostics_.empty()) return {};
                         if (node.typeInfo.isFunction()) {
                             if (value.typeInfo != node.typeInfo) {
                                 throw RuntimeFault(statement.location, "TypeError", "Cannot initialize '" + node.name + "' with " + typeName(value.typeInfo) + "; expects " + typeName(node.typeInfo));
                             }
-                        } else {
+                        } else if (!polymorphic && node.type != ValueType::Error){
                             value = promote(value, node.type, statement.location);
                         }
 
@@ -1048,6 +1250,7 @@ namespace cmath::language::detail {
                     
                     } else if constexpr(std::is_same_v<T, IRReturn>) {
                         RuntimeValue value{ValueType::Unit, std::monostate{}};
+                        const bool polymorphic = hasUnresolvedTypeVariable(node.typeInfo);
                         if (node.expression) {
                             value = evaluate(node.expression, environment);
                             if (!diagnostics_.empty()) return {};
@@ -1055,7 +1258,7 @@ namespace cmath::language::detail {
                                 if (value.typeInfo != node.typeInfo) {
                                     throw RuntimeFault(statement.location, "TypeError", "Cannot return " + typeName(value.typeInfo) + "; expected " + typeName(node.typeInfo));
                                 } 
-                            } else {
+                            } else if (!polymorphic || node.type != ValueType::Error) {
                                 value = promote(value, node.type, statement.location);
                             }
                         }
